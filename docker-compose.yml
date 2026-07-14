@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  gateway:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - DB_PATH=/app/data/ledger.db
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      - local_vllm
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: dashboard.Dockerfile
+    ports:
+      - "8501:8501"
+    environment:
+      - DB_PATH=/app/data/ledger.db
+    volumes:
+      - ./data:/app/data
+
+  local_vllm:
+    # Simulating a local vLLM / llama.cpp backend
+    image: ghcr.io/ggerganov/llama.cpp:server
+    ports:
+      - "8000:8080"
+    command: -m /models/dummy.gguf --host 0.0.0.0 --port 8080
+    # In a real setup, this mounts your quantized models
