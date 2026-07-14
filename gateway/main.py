@@ -1,27 +1,66 @@
 from fastapi import FastAPI, Depends, Request, HTTPException
+from fastapi.responses import Response
 from contextlib import asynccontextmanager
 from typing import Dict, Any, List
 import os
+import uuid
+import asyncio
+import logging
+from prometheus_client import make_asgi_app
 
-from gateway.auth import verify_api_key
+from gateway.auth import verify_api_key, load_api_keys
 from gateway import load_config
+import time
 from gateway.ledger.store import LedgerStore
 from gateway.policy.budget import BudgetPolicy, BudgetExceededException
 from gateway.policy.circuit_breaker import CircuitBreakerRegistry
 from gateway.policy.router import Router, NoAvailableBackendException
+from gateway.telemetry.metrics import observe_request
 
 from gateway.adapters.openai_adapter import OpenAIAdapter
 from gateway.adapters.anthropic_adapter import AnthropicAdapter
 from gateway.adapters.local_vllm_adapter import LocalVLLMAdapter
 
+import json
 import logging
-logging.basicConfig(level=logging.INFO)
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record):
+        log_record = {
+            "timestamp": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "message": record.getMessage(),
+            "logger": record.name
+        }
+        return json.dumps(log_record)
+
+handler = logging.StreamHandler()
+handler.setFormatter(JsonFormatter())
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+logger.addHandler(handler)
+# Remove default handlers if any
+for h in logger.handlers[:-1]:
+    logger.removeHandler(h)
 
 # Globals
 ledger = None
 budget_policy = None
 circuit_registry = None
 router = None
+
+async def health_check_loop():
+    while True:
+        try:
+            if router and circuit_registry:
+                for adapter in router.adapters:
+                    is_healthy = await adapter.health_check()
+                    breaker = circuit_registry.get_breaker(adapter.id)
+                    if not is_healthy:
+                        breaker.record_failure()
+        except Exception as e:
+            logging.error(f"Health check loop error: {e}")
+        await asyncio.sleep(60)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -32,6 +71,7 @@ async def lifespan(app: FastAPI):
     budgets_config_path = os.path.join(os.path.dirname(__file__), "..", "configs", "budgets.yaml")
     budgets = load_config(budgets_config_path).get("budgets", [])
     ledger.load_budgets_from_config(budgets)
+    load_api_keys()
     
     budget_policy = BudgetPolicy(ledger)
     
@@ -39,6 +79,7 @@ async def lifespan(app: FastAPI):
     cb_config_path = os.path.join(os.path.dirname(__file__), "..", "configs", "circuit_breaker.yaml")
     cb_config = load_config(cb_config_path).get("circuit_breaker", {})
     circuit_registry = CircuitBreakerRegistry(
+        ledger=ledger,
         failure_threshold=cb_config.get("failure_threshold", 3),
         cooldown_sec=cb_config.get("cooldown_period_sec", 30)
     )
@@ -60,7 +101,11 @@ async def lifespan(app: FastAPI):
     strategy = load_config(routing_config_path).get("routing", {}).get("strategy", "cost_first")
     router = Router(adapters, circuit_registry, strategy=strategy)
     
+    bg_task = asyncio.create_task(health_check_loop())
+    
     yield
+    
+    bg_task.cancel()
 
 app = FastAPI(
     title="Enterprise LLM Gateway",
@@ -69,47 +114,58 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+app.mount("/metrics", make_asgi_app())
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: Request, api_key: str = Depends(verify_api_key)):
+async def chat_completions(request: Request, response: Response, api_key: str = Depends(verify_api_key)):
+    request_id = str(uuid.uuid4())
+    response.headers["X-Request-ID"] = request_id
+    
     body = await request.json()
     messages = body.get("messages", [])
     if not messages:
         raise HTTPException(status_code=400, detail="Messages list is required")
         
-    # Estimated cost could be pre-calculated based on token estimate
+    # Heuristic cost estimation
     try:
-        budget_policy.check_preflight(api_key, estimated_cost=0.01)
+        approx_tokens = sum(len(m.get("content", "")) for m in messages) / 4
+        estimated_cost = (approx_tokens / 1000.0) * 0.001
+        budget_policy.check_preflight(api_key, estimated_cost=estimated_cost)
     except BudgetExceededException as e:
         raise HTTPException(status_code=429, detail=str(e))
         
     try:
-        response = await router.execute(messages, **body)
+        kwargs = {k: v for k, v in body.items() if k not in ["messages", "model"]}
+        backend_response = await router.execute(messages, **kwargs)
+        observe_request(backend_response.backend_id, "success", backend_response.latency_ms, backend_response.cost_usd)
     except NoAvailableBackendException as e:
+        observe_request("unknown", "error", 0.0, 0.0)
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
+        observe_request("unknown", "error", 0.0, 0.0)
         raise HTTPException(status_code=500, detail=f"Gateway internal error: {str(e)}")
         
     # Record spend
     ledger.record_request(
         api_key=api_key,
-        req_id=response.id,
-        backend=response.backend_id,
-        model=response.model,
-        prompt_tokens=response.prompt_tokens,
-        comp_tokens=response.completion_tokens,
-        cost=response.cost_usd,
-        latency=response.latency_ms
+        req_id=request_id,
+        backend=backend_response.backend_id,
+        model=backend_response.model,
+        prompt_tokens=backend_response.prompt_tokens,
+        comp_tokens=backend_response.completion_tokens,
+        cost=backend_response.cost_usd,
+        latency=backend_response.latency_ms
     )
     
     return {
-        "id": response.id,
+        "id": backend_response.id,
         "object": "chat.completion",
-        "created": int(response.latency_ms), # mockup timestamp
-        "model": response.model,
+        "created": int(time.time()),
+        "model": backend_response.model,
         "choices": [
             {
                 "index": i,
@@ -119,11 +175,11 @@ async def chat_completions(request: Request, api_key: str = Depends(verify_api_k
                 },
                 "finish_reason": "stop"
             }
-            for i, msg in enumerate(response.messages)
+            for i, msg in enumerate(backend_response.messages)
         ],
         "usage": {
-            "prompt_tokens": response.prompt_tokens,
-            "completion_tokens": response.completion_tokens,
-            "total_tokens": response.prompt_tokens + response.completion_tokens
+            "prompt_tokens": backend_response.prompt_tokens,
+            "completion_tokens": backend_response.completion_tokens,
+            "total_tokens": backend_response.prompt_tokens + backend_response.completion_tokens
         }
     }
