@@ -1,9 +1,11 @@
 import time
 import pytest
 from gateway.policy.circuit_breaker import CircuitBreaker, CircuitState
+from gateway.ledger.store import LedgerStore
 
 def test_circuit_breaker_state_machine():
-    cb = CircuitBreaker(failure_threshold=2, cooldown_sec=1)
+    ledger = LedgerStore(":memory:")
+    cb = CircuitBreaker(backend_id="test_backend", ledger=ledger, failure_threshold=2, cooldown_sec=1)
     
     assert cb.state == CircuitState.CLOSED
     assert cb.can_request() == True
