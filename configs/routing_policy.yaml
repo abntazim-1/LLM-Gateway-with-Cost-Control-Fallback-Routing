@@ -1,0 +1,4 @@
+routing:
+  strategy: cost_first  # cost_first, latency_first, capability
+  fallback_enabled: true
+  max_retries: 2

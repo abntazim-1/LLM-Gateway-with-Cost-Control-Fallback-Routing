@@ -1,0 +1,7 @@
+budgets:
+  - api_key: "sk-test-tier-1"
+    daily_limit_usd: 1.00
+    monthly_limit_usd: 20.00
+  - api_key: "sk-demo-live"
+    daily_limit_usd: 5.00
+    monthly_limit_usd: 50.00

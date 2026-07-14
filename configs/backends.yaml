@@ -1,0 +1,31 @@
+backends:
+  - id: openai-gpt-4o-mini
+    provider: openai
+    model: gpt-4o-mini
+    endpoint: "https://api.openai.com/v1"
+    cost_per_1k_prompt: 0.00015
+    cost_per_1k_completion: 0.0006
+    capabilities:
+      - function_calling
+      - json_mode
+    context_length: 128000
+
+  - id: anthropic-claude-3-haiku
+    provider: anthropic
+    model: claude-3-haiku-20240307
+    endpoint: "https://api.anthropic.com/v1"
+    cost_per_1k_prompt: 0.00025
+    cost_per_1k_completion: 0.00125
+    capabilities:
+      - function_calling
+    context_length: 200000
+
+  - id: local-llama-3-8b
+    provider: local_vllm
+    model: Meta-Llama-3-8B-Instruct
+    endpoint: "http://localhost:8000/v1"
+    cost_per_1k_prompt: 0.0000
+    cost_per_1k_completion: 0.0000
+    capabilities:
+      - json_mode
+    context_length: 8192
