@@ -33,26 +33,25 @@ class AnthropicAdapter(BaseAdapter):
         if "max_tokens" not in supported_kwargs:
             supported_kwargs["max_tokens"] = 1024
         
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.post(
-                    f"{self.endpoint}/messages",
-                    headers={
-                        "x-api-key": self.api_key,
-                        "anthropic-version": "2023-06-01",
-                        "content-type": "application/json"
-                    },
-                    json={
-                        "model": self.model,
-                        "system": converted["system"],
-                        "messages": converted["messages"],
-                        **supported_kwargs
-                    },
-                    timeout=kwargs.get("timeout", 10.0)
-                )
-                response.raise_for_status()
-                data = response.json()
-            except Exception as e:
+        try:
+            response = await self.client.post(
+                f"{self.endpoint}/messages",
+                headers={
+                    "x-api-key": self.api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json"
+                },
+                json={
+                    "model": self.model,
+                    "system": converted["system"],
+                    "messages": converted["messages"],
+                    **supported_kwargs
+                },
+                timeout=kwargs.get("timeout", 10.0)
+            )
+            response.raise_for_status()
+            data = response.json()
+        except Exception as e:
                 raise AdapterException(f"Anthropic request failed: {str(e)}")
 
         latency_ms = (time.time() - start_time) * 1000

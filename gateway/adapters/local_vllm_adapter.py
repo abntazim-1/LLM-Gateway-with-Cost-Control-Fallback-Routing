@@ -10,21 +10,20 @@ class LocalVLLMAdapter(BaseAdapter):
     async def complete(self, messages: List[Dict[str, str]], **kwargs) -> NormalizedResponse:
         start_time = time.time()
         
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.post(
-                    f"{self.endpoint}/chat/completions",
-                    headers={"Content-Type": "application/json"},
-                    json={
-                        "model": self.model,
-                        "messages": messages,
-                        **kwargs
-                    },
-                    timeout=kwargs.get("timeout", 10.0)
-                )
-                response.raise_for_status()
-                data = response.json()
-            except Exception as e:
+        try:
+            response = await self.client.post(
+                f"{self.endpoint}/chat/completions",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "model": self.model,
+                    "messages": messages,
+                    **self._filter_kwargs(kwargs)
+                },
+                timeout=kwargs.get("timeout", 60.0)
+            )
+            response.raise_for_status()
+            data = response.json()
+        except Exception as e:
                 raise AdapterException(f"Local vLLM request failed: {str(e)}")
 
         latency_ms = (time.time() - start_time) * 1000
@@ -53,14 +52,13 @@ class LocalVLLMAdapter(BaseAdapter):
         )
 
     async def health_check(self) -> bool:
-        async with httpx.AsyncClient() as client:
-            try:
-                # vLLM provides a /health endpoint usually
-                # If using standard OpenAI compat server, /v1/models is safe
-                response = await client.get(
-                    f"{self.endpoint}/models",
-                    timeout=2.0
-                )
-                return response.status_code == 200
-            except Exception:
-                return False
+        try:
+            # vLLM provides a /health endpoint usually
+            # If using standard OpenAI compat server, /v1/models is safe
+            response = await self.client.get(
+                f"{self.endpoint}/models",
+                timeout=2.0
+            )
+            return response.status_code == 200
+        except Exception:
+            return False

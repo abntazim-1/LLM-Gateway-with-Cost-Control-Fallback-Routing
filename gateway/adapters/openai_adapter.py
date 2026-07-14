@@ -15,24 +15,23 @@ class OpenAIAdapter(BaseAdapter):
             
         start_time = time.time()
         
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.post(
-                    f"{self.endpoint}/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {self.api_key}",
-                        "Content-Type": "application/json"
-                    },
-                    json={
-                        "model": self.model,
-                        "messages": messages,
-                        **kwargs
-                    },
-                    timeout=kwargs.get("timeout", 10.0)
-                )
-                response.raise_for_status()
-                data = response.json()
-            except Exception as e:
+        try:
+            response = await self.client.post(
+                f"{self.endpoint}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": self.model,
+                    "messages": messages,
+                    **self._filter_kwargs(kwargs)
+                },
+                timeout=kwargs.get("timeout", 10.0)
+            )
+            response.raise_for_status()
+            data = response.json()
+        except Exception as e:
                 raise AdapterException(f"OpenAI request failed: {str(e)}")
 
         latency_ms = (time.time() - start_time) * 1000
@@ -63,13 +62,12 @@ class OpenAIAdapter(BaseAdapter):
     async def health_check(self) -> bool:
         if not self.api_key:
             return False
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.get(
-                    f"{self.endpoint}/models",
-                    headers={"Authorization": f"Bearer {self.api_key}"},
-                    timeout=5.0
-                )
-                return response.status_code == 200
-            except Exception:
-                return False
+        try:
+            response = await self.client.get(
+                f"{self.endpoint}/models",
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=5.0
+            )
+            return response.status_code == 200
+        except Exception:
+            return False
