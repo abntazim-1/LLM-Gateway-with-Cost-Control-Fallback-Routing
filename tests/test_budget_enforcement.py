@@ -4,8 +4,6 @@ from gateway.ledger.store import LedgerStore
 
 def test_budget_enforcement():
     ledger = LedgerStore(":memory:")
-    # Reset db for test
-    ledger._init_db(":memory:")
     
     budgets = [
         {"api_key": "sk-test", "daily_limit_usd": 1.0, "monthly_limit_usd": 10.0}
