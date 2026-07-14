@@ -41,3 +41,4 @@ venv.bak/
 
 # Implementation plan (excluded as per user request)
 llm-gateway-enterprise-plan.md
+docs/
