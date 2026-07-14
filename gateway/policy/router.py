@@ -1,4 +1,5 @@
 from typing import List, Dict, Any, Optional
+import asyncio
 from gateway.adapters.base import BaseAdapter
 from gateway.policy.circuit_breaker import CircuitBreakerRegistry
 import logging
@@ -18,6 +19,7 @@ class Router:
         self.adapters = adapters
         self.circuit_registry = circuit_registry
         self.strategy = strategy
+        self.latency_ema: Dict[str, float] = {}
 
     def get_ranked_adapters(self, **kwargs) -> List[BaseAdapter]:
         """Rank adapters based on the routing strategy and capabilities."""
@@ -41,8 +43,8 @@ class Router:
             # For cost first, prioritize lowest cost per 1k prompt
             candidates.sort(key=lambda a: a.cost_per_1k_prompt)
         elif self.strategy == "latency_first":
-            # Real implementation would use historical latency
-            pass
+            # Rank by EMA latency, defaults to a high value if unknown
+            candidates.sort(key=lambda a: self.latency_ema.get(a.id, 9999.0))
             
         return candidates
 
@@ -52,14 +54,29 @@ class Router:
         last_error = None
         for adapter in ranked:
             breaker = self.circuit_registry.get_breaker(adapter.id)
-            try:
-                logger.info(f"Routing request to {adapter.id}")
-                response = await adapter.complete(messages, **kwargs)
-                breaker.record_success()
-                return response
-            except Exception as e:
-                logger.warning(f"Backend {adapter.id} failed: {str(e)}")
-                breaker.record_failure()
-                last_error = e
+            
+            max_retries = 2
+            for attempt in range(max_retries + 1):
+                try:
+                    logger.info(f"Routing request to {adapter.id} (attempt {attempt + 1}/{max_retries + 1})")
+                    response = await adapter.complete(messages, **kwargs)
+                    
+                    # Update Exponential Moving Average (EMA) for latency
+                    alpha = 0.2
+                    current_ema = self.latency_ema.get(adapter.id, response.latency_ms)
+                    self.latency_ema[adapter.id] = (alpha * response.latency_ms) + ((1 - alpha) * current_ema)
+                    
+                    breaker.record_success()
+                    return response
+                except Exception as e:
+                    last_error = e
+                    if attempt < max_retries:
+                        backoff = 2 ** attempt
+                        logger.warning(f"Transient failure on {adapter.id} ({str(e)}). Retrying in {backoff}s...")
+                        await asyncio.sleep(backoff)
+                    else:
+                        logger.warning(f"Backend {adapter.id} failed after {max_retries + 1} attempts: {str(e)}")
+                        breaker.record_failure()
+                        break # Move to next adapter
 
         raise NoAvailableBackendException(f"All capable backends failed. Last error: {str(last_error)}")
