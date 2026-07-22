@@ -4,7 +4,7 @@ backends:
     model: qwen2.5:0.5b
     endpoint: "http://localhost:11434/v1"
     cost_per_1k_prompt: 0.0020
-    cost_per_1k_completion: 0.00015
+    cost_per_1k_completion: 0.00015 
     capabilities:
       - json_mode
     context_length: 8192
@@ -24,7 +24,7 @@ backends:
     model: phi3:latest
     endpoint: "http://localhost:11434/v1"
     cost_per_1k_prompt: 0.000001
-    cost_per_1k_completion: 0.00035
+    cost_per_1k_completion: 0.000002
     capabilities:
       - json_mode
     context_length: 8192
