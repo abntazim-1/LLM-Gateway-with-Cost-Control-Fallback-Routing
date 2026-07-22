@@ -38,7 +38,7 @@ venv.bak/
 # SQLite databases
 *.sqlite
 *.sqlite3
-
-# Implementation plan (excluded as per user request)
-llm-gateway-enterprise-plan.md
+*.db
+*.db-wal
+*.db-shm
 docs/
