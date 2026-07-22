@@ -1,7 +1,8 @@
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, AsyncGenerator
 import httpx
 from gateway.adapters.base import BaseAdapter, NormalizedResponse, NormalizedMessage, AdapterException
+from gateway.adapters.transformer import ParameterTransformer
 
 class LocalVLLMAdapter(BaseAdapter):
     def __init__(self, config: Dict[str, Any]):
@@ -17,7 +18,7 @@ class LocalVLLMAdapter(BaseAdapter):
                 json={
                     "model": self.model,
                     "messages": messages,
-                    **self._filter_kwargs(kwargs)
+                    **ParameterTransformer.openai_clean_kwargs(kwargs)
                 },
                 timeout=kwargs.get("timeout", 60.0)
             )
@@ -50,6 +51,39 @@ class LocalVLLMAdapter(BaseAdapter):
             cost_usd=cost_usd,
             latency_ms=latency_ms
         )
+
+    async def complete_stream(self, messages: List[Dict[str, str]], **kwargs) -> AsyncGenerator[Dict[str, Any], None]:
+        try:
+            request_data = {
+                "model": self.model,
+                "messages": messages,
+                "stream": True,
+                **ParameterTransformer.openai_clean_kwargs(kwargs)
+            }
+            async with self.client.stream(
+                "POST",
+                f"{self.endpoint}/chat/completions",
+                headers={"Content-Type": "application/json"},
+                json=request_data,
+                timeout=kwargs.get("timeout", 60.0)
+            ) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            break
+                        import json
+                        try:
+                            chunk_data = json.loads(data_str)
+                            yield chunk_data
+                        except Exception:
+                            continue
+        except Exception as e:
+            raise AdapterException(f"Local vLLM stream request failed: {str(e)}")
 
     async def health_check(self) -> bool:
         try:

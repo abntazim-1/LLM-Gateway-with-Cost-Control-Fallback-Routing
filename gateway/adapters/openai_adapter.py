@@ -1,31 +1,47 @@
 import time
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, AsyncGenerator
 import httpx
 from gateway.adapters.base import BaseAdapter, NormalizedResponse, NormalizedMessage, AdapterException
+from gateway.adapters.transformer import ParameterTransformer
+from gateway.policy.key_pool import ProviderKeyPool
 
 class OpenAIAdapter(BaseAdapter):
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
         self.api_key = os.environ.get("OPENAI_API_KEY")
+        self.key_pool = ProviderKeyPool()
+        
+        # Load keys from config list or env var
+        cfg_keys = config.get("api_keys", [])
+        if isinstance(cfg_keys, list):
+            for k in cfg_keys:
+                self.key_pool.add_key(k)
+        if self.api_key:
+            for k in self.api_key.split(","):
+                self.key_pool.add_key(k)
+
+    def _get_active_key(self) -> str:
+        key = self.key_pool.get_next_key()
+        if not key:
+            raise AdapterException("OPENAI_API_KEY not set")
+        return key
 
     async def complete(self, messages: List[Dict[str, str]], **kwargs) -> NormalizedResponse:
-        if not self.api_key:
-            raise AdapterException("OPENAI_API_KEY not set")
-            
+        active_key = self._get_active_key()
         start_time = time.time()
         
         try:
             response = await self.client.post(
                 f"{self.endpoint}/chat/completions",
                 headers={
-                    "Authorization": f"Bearer {self.api_key}",
+                    "Authorization": f"Bearer {active_key}",
                     "Content-Type": "application/json"
                 },
                 json={
                     "model": self.model,
                     "messages": messages,
-                    **self._filter_kwargs(kwargs)
+                    **ParameterTransformer.openai_clean_kwargs(kwargs)
                 },
                 timeout=kwargs.get("timeout", 10.0)
             )
@@ -58,6 +74,44 @@ class OpenAIAdapter(BaseAdapter):
             cost_usd=cost_usd,
             latency_ms=latency_ms
         )
+
+    async def complete_stream(self, messages: List[Dict[str, str]], **kwargs) -> AsyncGenerator[Dict[str, Any], None]:
+        active_key = self._get_active_key()
+            
+        try:
+            request_data = {
+                "model": self.model,
+                "messages": messages,
+                "stream": True,
+                **ParameterTransformer.openai_clean_kwargs(kwargs)
+            }
+            async with self.client.stream(
+                "POST",
+                f"{self.endpoint}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {active_key}",
+                    "Content-Type": "application/json"
+                },
+                json=request_data,
+                timeout=kwargs.get("timeout", 30.0)
+            ) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            break
+                        import json
+                        try:
+                            chunk_data = json.loads(data_str)
+                            yield chunk_data
+                        except Exception:
+                            continue
+        except Exception as e:
+            raise AdapterException(f"OpenAI stream request failed: {str(e)}")
 
     async def health_check(self) -> bool:
         if not self.api_key:

@@ -1,6 +1,6 @@
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, AsyncGenerator
 from pydantic import BaseModel
 
 class NormalizedMessage(BaseModel):
@@ -45,6 +45,11 @@ class BaseAdapter(ABC):
     @abstractmethod
     async def complete(self, messages: List[Dict[str, str]], **kwargs) -> NormalizedResponse:
         """Execute a completion request."""
+        pass
+
+    @abstractmethod
+    async def complete_stream(self, messages: List[Dict[str, str]], **kwargs) -> AsyncGenerator[Dict[str, Any], None]:
+        """Execute a streaming completion request."""
         pass
 
     @abstractmethod
