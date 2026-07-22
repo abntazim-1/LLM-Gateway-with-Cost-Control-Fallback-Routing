@@ -7,12 +7,12 @@ class BudgetPolicy:
     def __init__(self, ledger: LedgerStore):
         self.ledger = ledger
 
-    def check_preflight(self, api_key: str, estimated_cost: float = 0.0) -> bool:
+    async def check_preflight(self, api_key: str, estimated_cost: float = 0.0) -> bool:
         """
         Check if the request is allowed given the current spend and estimated cost.
         Raises BudgetExceededException if budget is blown.
         """
-        budget = self.ledger.get_budget(api_key)
+        budget = await self.ledger.get_budget(api_key)
         if not budget:
             # If no budget is found, we might default to deny
             raise BudgetExceededException("No budget found for API key")

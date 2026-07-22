@@ -18,35 +18,35 @@ class CircuitBreaker:
         self.failure_threshold = failure_threshold
         self.cooldown_sec = cooldown_sec
 
-    def _get_state(self):
+    async def _get_state(self):
         if self.ledger:
-            data = self.ledger.get_circuit_breaker_state(self.backend_id)
+            data = await self.ledger.get_circuit_breaker_state(self.backend_id)
             if data:
                 return CircuitState(data["state"]), data["consecutive_failures"], data["last_failure_time"]
         return CircuitState.CLOSED, 0, 0.0
 
-    def _save_state(self, state: CircuitState, consecutive_failures: int, last_failure_time: float):
+    async def _save_state(self, state: CircuitState, consecutive_failures: int, last_failure_time: float):
         if self.ledger:
-            self.ledger.update_circuit_breaker_state(
+            await self.ledger.update_circuit_breaker_state(
                 self.backend_id, state.value, consecutive_failures, last_failure_time
             )
         val_map = {CircuitState.CLOSED: 0, CircuitState.HALF_OPEN: 1, CircuitState.OPEN: 2}
         CIRCUIT_BREAKER_STATE.labels(backend=self.backend_id).set(val_map[state])
 
-    @property
-    def state(self) -> CircuitState:
-        return self._get_state()[0]
+    async def get_state(self) -> CircuitState:
+        state_info = await self._get_state()
+        return state_info[0]
 
-    def record_success(self):
+    async def record_success(self):
         """Called when a request succeeds."""
-        state, _, _ = self._get_state()
+        state, _, _ = await self._get_state()
         if state in [CircuitState.OPEN, CircuitState.HALF_OPEN]:
             logger.info("Circuit breaker closed (healthy).")
-        self._save_state(CircuitState.CLOSED, 0, 0.0)
+        await self._save_state(CircuitState.CLOSED, 0, 0.0)
 
-    def record_failure(self):
+    async def record_failure(self):
         """Called when a request fails."""
-        state, consecutive_failures, _ = self._get_state()
+        state, consecutive_failures, _ = await self._get_state()
         consecutive_failures += 1
         last_failure_time = time.time()
         
@@ -55,11 +55,11 @@ class CircuitBreaker:
                 logger.warning(f"Circuit breaker opened! Failures: {consecutive_failures}")
             state = CircuitState.OPEN
             
-        self._save_state(state, consecutive_failures, last_failure_time)
+        await self._save_state(state, consecutive_failures, last_failure_time)
 
-    def can_request(self) -> bool:
+    async def can_request(self) -> bool:
         """Determines if a request should be allowed through the circuit breaker."""
-        state, _, last_failure_time = self._get_state()
+        state, consecutive_failures, last_failure_time = await self._get_state()
         
         if state == CircuitState.CLOSED:
             return True
@@ -68,7 +68,7 @@ class CircuitBreaker:
             # Check if cooldown has elapsed
             if time.time() - last_failure_time >= self.cooldown_sec:
                 logger.info("Circuit breaker half-open. Testing recovery.")
-                self._save_state(CircuitState.HALF_OPEN, _, last_failure_time)
+                await self._save_state(CircuitState.HALF_OPEN, consecutive_failures, last_failure_time)
                 return True
             return False
             
