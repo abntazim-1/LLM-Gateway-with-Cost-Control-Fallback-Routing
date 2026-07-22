@@ -28,7 +28,25 @@ CIRCUIT_BREAKER_STATE = Gauge(
     ["backend"]
 )
 
+# Cache Metrics
+CACHE_HITS_TOTAL = Counter(
+    "gateway_cache_hits_total",
+    "Total number of prompt cache hits"
+)
+
+CACHE_MISSES_TOTAL = Counter(
+    "gateway_cache_misses_total",
+    "Total number of prompt cache misses"
+)
+
 def observe_request(backend: str, status: str, latency: float, cost: float):
     REQUESTS_TOTAL.labels(backend=backend, status=status).inc()
     LATENCY_MS.labels(backend=backend).observe(latency)
     COST_TOTAL.labels(backend=backend).inc(cost)
+
+def observe_cache(hit: bool):
+    if hit:
+        CACHE_HITS_TOTAL.inc()
+    else:
+        CACHE_MISSES_TOTAL.inc()
+
