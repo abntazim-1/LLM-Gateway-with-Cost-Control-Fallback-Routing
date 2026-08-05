@@ -41,4 +41,6 @@ venv.bak/
 *.db
 *.db-wal
 *.db-shm
-docs/
+docs/$env:ANTHROPIC_AUTH_TOKEN="sk-QHsF84wxcTaMJFQnuRm4Szs40UYWW1ijw2Ho6LvXTK4PZbsG"
+$env:ANTHROPIC_BASE_URL="https://agentrouter.org"
+$env:ANTHROPIC_MODEL="claude-opus-4.6"
