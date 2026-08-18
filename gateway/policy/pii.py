@@ -35,6 +35,34 @@ class PiiVault:
 
         return sanitized, vault_mapping
 
+    def mask_messages(self, messages: List[Dict[str, str]]) -> Tuple[List[Dict[str, str]], Dict[str, str]]:
+        """Mask PII across a full conversation. Placeholder counters are shared
+        across messages so tokens stay unique and the merged mapping restores
+        every occurrence correctly."""
+        vault_mapping: Dict[str, str] = {}
+        counters: Dict[str, int] = {}
+        masked_messages: List[Dict[str, str]] = []
+
+        for msg in messages:
+            content = msg.get("content", "")
+            if not content:
+                masked_messages.append({"role": msg.get("role", ""), "content": content})
+                continue
+
+            sanitized = content
+            for label, pattern in self.patterns.items():
+                matches = list(pattern.finditer(sanitized))
+                for match in reversed(matches):
+                    val = match.group(0)
+                    counters[label] = counters.get(label, 0) + 1
+                    token = f"[{label}_{counters[label]}]"
+                    vault_mapping[token] = val
+                    sanitized = sanitized[:match.start()] + token + sanitized[match.end():]
+
+            masked_messages.append({"role": msg.get("role", ""), "content": sanitized})
+
+        return masked_messages, vault_mapping
+
     def restore_text(self, text: str, vault_mapping: Dict[str, str]) -> str:
         if not text or not vault_mapping:
             return text
