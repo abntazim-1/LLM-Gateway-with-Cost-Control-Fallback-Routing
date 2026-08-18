@@ -3,14 +3,25 @@ import pandas as pd
 import os
 import json
 import httpx
+from dotenv import load_dotenv
+
+# Load .env from the project root (works regardless of CWD)
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+load_dotenv(os.path.join(_ROOT, ".env"), override=False)
+
 
 st.set_page_config(page_title="LLM Gateway Portal", layout="wide", page_icon="⚡")
 
 # Custom CSS for rich premium aesthetics (Curated sleek dark theme tokens)
 st.markdown("""
 <style>
-    .reportview-container {
-        background: #0F172A;
+    .stApp {
+        background: #0B0F19;
+        color: #F1F5F9;
+    }
+    [data-testid="stSidebar"] {
+        background: #111827;
+        border-right: 1px solid #1F2937;
     }
     .metric-card {
         background: #1E293B;
@@ -18,6 +29,7 @@ st.markdown("""
         border-radius: 12px;
         padding: 20px;
         box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1);
+        margin-bottom: 12px;
     }
     .status-badge {
         padding: 4px 8px;
@@ -29,15 +41,18 @@ st.markdown("""
     .status-open { background-color: #7F1D1D; color: #F87171; }
     .status-half-open { background-color: #78350F; color: #FBBF24; }
 </style>
-""", unsafe_allowed_html=True)
+""", unsafe_allow_html=True)
 
 st.title("⚡ Enterprise LLM Gateway Portal")
 
-tab1, tab2, tab3 = st.tabs(["💬 Chat Sandbox (SSE Stream)", "📊 System Metrics & Caching", "⚙️ Admin Control Center"])
+with st.sidebar:
+    st.header("🔑 Connection Settings")
+    gateway_url = st.text_input("Gateway URL", value=os.environ.get("GATEWAY_URL", "http://localhost:8080"))
+    admin_token = st.text_input("Admin Secret Key", value=os.environ.get("ADMIN_API_KEY", ""), type="password", help="Must match ADMIN_API_KEY configured on the Gateway.")
 
-admin_token = os.environ.get("ADMIN_API_KEY", "admin-default-secret")
-headers = {"X-Admin-Token": admin_token}
-gateway_url = os.environ.get("GATEWAY_URL", "http://localhost:8080")
+headers = {"X-Admin-Token": admin_token} if admin_token else {}
+
+tab1, tab2, tab3 = st.tabs(["💬 Chat Sandbox (SSE Stream)", "📊 System Metrics & Caching", "⚙️ Admin Control Center"])
 
 with tab1:
     st.markdown("### Interactive Chat Sandbox")
@@ -45,9 +60,9 @@ with tab1:
     
     col1, col2 = st.columns(2)
     with col1:
-        api_key = st.text_input("Client API Key", value="sk-test-tier-1", type="password")
+        api_key = st.text_input("Client API Key", value=os.environ.get("CLIENT_API_KEY_TIER1", "sk-test-tier-1"), type="password")
     with col2:
-        model_name = st.text_input("Target Model Heuristic", value="gpt-4o-mini")
+        model_name = st.text_input("Target Model Heuristic", value=os.environ.get("DEFAULT_MODEL", "qwen2.5:0.5b"))
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
@@ -190,7 +205,7 @@ with tab3:
                         <p>Health: <strong>{h_symbol}</strong></p>
                         <p>Circuit State: <span class="status-badge {badge_style}">{cb_state}</span></p>
                     </div>
-                    """, unsafe_allowed_html=True)
+                    """, unsafe_allow_html=True)
         else:
             st.warning("Could not fetch active health statuses.")
             
