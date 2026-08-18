@@ -7,9 +7,15 @@ import os
 import uuid
 import asyncio
 import logging
+import secrets
+from dotenv import load_dotenv
 from prometheus_client import make_asgi_app
 
-from gateway.auth import verify_api_key, load_api_keys
+# Load .env from the project root (works regardless of CWD)
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+load_dotenv(os.path.join(_ROOT, ".env"), override=False)
+
+from gateway.auth import verify_api_key, load_api_keys, set_ledger
 from gateway import load_config
 import time
 from gateway.ledger.store import LedgerStore
@@ -25,10 +31,11 @@ from gateway.config_manager import ConfigManager
 from gateway.adapters.openai_adapter import OpenAIAdapter
 from gateway.adapters.anthropic_adapter import AnthropicAdapter
 from gateway.adapters.local_vllm_adapter import LocalVLLMAdapter
-from gateway.policy.pii import PiiSanitizer
+from gateway.policy.pii import PiiSanitizer, PiiVault
 from gateway.policy.cache import PromptCache
 
 import json
+import hashlib
 import logging
 
 class JsonFormatter(logging.Formatter):
@@ -58,7 +65,64 @@ circuit_registry = None
 router = None
 prompt_cache = None
 pii_sanitizer = None
+pii_vault = None
 guardrails_pipeline = None
+
+
+def _key_hash(api_key: str) -> str:
+    """Stable non-reversible identifier for telemetry (never the raw key)."""
+    return hashlib.sha256(api_key.encode()).hexdigest()[:16]
+
+
+def _count_tokens(messages: List[Dict[str, Any]], completion_text: str = "") -> tuple:
+    """Best-effort token counting: tiktoken when available, chars/4 otherwise."""
+    try:
+        import tiktoken
+        encoding = tiktoken.get_encoding("cl100k_base")
+        prompt_tokens = sum(len(encoding.encode(m.get("content", ""))) for m in messages)
+        completion_tokens = len(encoding.encode(completion_text)) if completion_text else 0
+    except Exception:
+        prompt_tokens = max(1, int(sum(len(m.get("content", "")) for m in messages) / 4.0))
+        completion_tokens = max(0, int(len(completion_text) / 4.0))
+    return prompt_tokens, completion_tokens
+
+
+def _adapter_cost(backend_id: str, prompt_tokens: int, completion_tokens: int) -> float:
+    """Compute cost against the adapter that served the request, if known."""
+    adapter = next((a for a in router.adapters if a.id == backend_id), None) if router else None
+    if adapter is None:
+        return 0.0
+    return (
+        (prompt_tokens / 1000.0) * adapter.cost_per_1k_prompt
+        + (completion_tokens / 1000.0) * adapter.cost_per_1k_completion
+    )
+
+
+def _finalize_stream_chunk(chunk: Dict[str, Any], vault_mapping: Dict[str, str]) -> tuple:
+    """Apply output-guardrail secret redaction (on masked text) and PII vault
+    restore to a streaming chunk's delta content.
+
+    Returns (masked_content_for_accumulation, outgoing_chunk). Masked tokens
+    contain no spaces, so word-level deltas keep them intact."""
+    choices = chunk.get("choices") or []
+    if not choices:
+        return None, chunk
+    delta = choices[0].get("delta") or {}
+    content = delta.get("content", "")
+    if not content:
+        return "", chunk
+
+    if guardrails_pipeline:
+        content = guardrails_pipeline.sanitize_completion(content)
+
+    restored = pii_vault.restore_text(content, vault_mapping) if vault_mapping else content
+    if restored == delta.get("content", ""):
+        return content, chunk  # nothing redacted or restored; skip the copy
+
+    delta_copy = {**delta, "content": restored}
+    chunk_copy = dict(chunk)
+    chunk_copy["choices"] = [{**choices[0], "delta": delta_copy}] + list(choices[1:])
+    return content, chunk_copy
 
 async def health_check_loop():
     while True:
@@ -67,7 +131,9 @@ async def health_check_loop():
                 for adapter in router.adapters:
                     is_healthy = await adapter.health_check()
                     breaker = circuit_registry.get_breaker(adapter.id)
-                    if not is_healthy:
+                    if is_healthy:
+                        await breaker.record_success()
+                    else:
                         await breaker.record_failure()
         except Exception as e:
             logging.error(f"Health check loop error: {e}")
@@ -75,20 +141,35 @@ async def health_check_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global ledger, ledger_queue, budget_policy, circuit_registry, router, prompt_cache, pii_sanitizer, guardrails_pipeline
+    global ledger, ledger_queue, budget_policy, circuit_registry, router, prompt_cache, pii_sanitizer, pii_vault, guardrails_pipeline
     
     # Init ledger & async queue
     ledger = LedgerStore("ledger.db")
     ledger_queue = AsyncLedgerQueue(ledger)
     ledger_queue.start()
 
-    budgets_config_path = os.path.join(os.path.dirname(__file__), "..", "configs", "budgets.yaml")
-    budgets = load_config(budgets_config_path).get("budgets", [])
+    raw_env_budgets = os.environ.get("GATEWAY_BUDGETS_JSON") or os.environ.get("GATEWAY_BUDGETS")
+    if raw_env_budgets:
+        try:
+            parsed = json.loads(raw_env_budgets)
+            budgets = parsed.get("budgets", parsed) if isinstance(parsed, dict) else parsed
+        except Exception as e:
+            logger.error(f"Failed to parse GATEWAY_BUDGETS environment variable: {e}")
+            budgets = []
+    else:
+        budgets_config_path = os.environ.get(
+            "BUDGETS_CONFIG_PATH",
+            os.path.join(os.path.dirname(__file__), "..", "configs", "budgets.yaml")
+        )
+        budgets = load_config(budgets_config_path).get("budgets", [])
+
     await ledger.load_budgets_from_config(budgets)
     load_api_keys(ledger_store=ledger)
+    set_ledger(ledger)  # inject ledger into auth module for DB-backed rate limiting
     
     prompt_cache = PromptCache(ttl_seconds=300)
     pii_sanitizer = PiiSanitizer()
+    pii_vault = PiiVault()
     guardrails_pipeline = GuardrailsPipeline()
     budget_policy = BudgetPolicy(ledger)
     
@@ -110,20 +191,33 @@ async def lifespan(app: FastAPI):
             adapters.append(OpenAIAdapter(cfg))
         elif cfg["provider"] == "anthropic":
             adapters.append(AnthropicAdapter(cfg))
-        elif cfg["provider"] == "local_vllm":
+        elif cfg["provider"] in ("local_vllm", "ollama"):
             adapters.append(LocalVLLMAdapter(cfg))
             
     # Init router
     routing_config_path = os.path.join(os.path.dirname(__file__), "..", "configs", "routing_policy.yaml")
-    strategy = load_config(routing_config_path).get("routing", {}).get("strategy", "cost_first")
-    router = Router(adapters, circuit_registry, strategy=strategy)
+    routing_cfg = load_config(routing_config_path).get("routing", {})
+    strategy = routing_cfg.get("strategy", "cost_first")
+    min_tokens_complex = routing_cfg.get("min_tokens_for_complex", 500)
+    router = Router(
+        adapters,
+        circuit_registry,
+        strategy=strategy,
+        timeout_sec=cb_config.get("request_timeout_sec", 30.0),
+        min_tokens_for_complex=min_tokens_complex,
+    )
     
+    if not os.environ.get("ADMIN_API_KEY"):
+        logger.warning("ADMIN_API_KEY environment variable is not configured. All admin endpoints will be disabled.")
+        
     bg_task = asyncio.create_task(health_check_loop())
     
     yield
     
     bg_task.cancel()
     await ledger_queue.stop()
+    if router:
+        await router.close()
 
 app = FastAPI(
     title="Enterprise LLM Gateway",
@@ -137,12 +231,30 @@ app.mount("/metrics", make_asgi_app())
 admin_key_header = APIKeyHeader(name="X-Admin-Token", auto_error=False)
 
 def verify_admin_key(admin_key_header: str = Security(admin_key_header)):
-    expected_token = os.environ.get("ADMIN_API_KEY", "admin-default-secret")
-    if not admin_key_header or admin_key_header != expected_token:
+    expected_token = os.environ.get("ADMIN_API_KEY")
+    if not expected_token:
+        logger.error("Admin endpoint accessed but ADMIN_API_KEY environment variable is not set")
+        raise HTTPException(
+            status_code=500,
+            detail="ADMIN_API_KEY environment variable is not configured on the server"
+        )
+    if not admin_key_header or not secrets.compare_digest(admin_key_header, expected_token):
         raise HTTPException(
             status_code=401,
             detail="Unauthorized Admin access"
         )
+
+@app.get("/")
+async def root():
+    return {
+        "service": "Enterprise LLM Gateway",
+        "status": "online",
+        "documentation": "/docs",
+        "health": "/health",
+        "backends_health": "/health/backends",
+        "metrics": "/metrics",
+        "dashboard_ui": "http://localhost:8501"
+    }
 
 @app.get("/health")
 async def health():
@@ -203,8 +315,14 @@ async def reload_config_endpoint(admin_key: str = Depends(verify_admin_key)):
         new_budgets = cm.load_budgets()
         
         if new_adapters:
+            old_adapters = router.adapters
             router.adapters = new_adapters
             router.strategy = new_strategy
+            for old_adapter in old_adapters:
+                try:
+                    await old_adapter.close()
+                except Exception as e:
+                    logger.error(f"Error closing old adapter {getattr(old_adapter, 'id', 'unknown')}: {e}")
         if new_budgets:
             await ledger.load_budgets_from_config(new_budgets)
             load_api_keys(ledger_store=ledger)
@@ -221,6 +339,10 @@ async def health_backends():
             is_healthy = await adapter.health_check()
             breaker = circuit_registry.get_breaker(adapter.id)
             cb_state = await breaker.get_state()
+            if is_healthy:
+                await breaker.record_success()
+            else:
+                await breaker.record_failure()
             results[adapter.id] = {
                 "provider": adapter.config["provider"],
                 "model": adapter.model,
@@ -248,8 +370,9 @@ async def chat_completions(request: Request, response: Response, api_key: str = 
         except GuardrailViolationException as e:
             raise HTTPException(status_code=400, detail=str(e))
         
-    # PII Sanitization
-    sanitized_messages = pii_sanitizer.sanitize_messages(messages)
+    # PII masking (reversible): the LLM only ever sees placeholders; the
+    # vault mapping restores the caller's original values on the response.
+    sanitized_messages, vault_mapping = pii_vault.mask_messages(messages)
     
     is_stream = body.get("stream", False)
     kwargs = {k: v for k, v in body.items() if k not in ["messages", "model"]}
@@ -258,24 +381,35 @@ async def chat_completions(request: Request, response: Response, api_key: str = 
     cached_response = prompt_cache.get(sanitized_messages, kwargs)
     if cached_response is not None:
         observe_cache(hit=True)
-        # Record 0 cost request in the ledger
-        store = ledger_queue if ledger_queue else ledger
-        await store.record_request(
-            api_key=api_key,
-            req_id=cached_response.get("id", f"cache-{uuid.uuid4()}"),
-            backend="cache",
-            model=cached_response.get("model", "cached-model"),
-            prompt_tokens=cached_response.get("usage", {}).get("prompt_tokens", 0),
-            comp_tokens=cached_response.get("usage", {}).get("completion_tokens", 0),
-            cost=0.0,
-            latency=0.0
-        )
+        with GatewayTracer.trace_span(
+            "chat.completion.cache",
+            attributes={
+                "api_key_hash": _key_hash(api_key),
+                "request_id": request_id,
+                "cache_hit": True,
+                "model": cached_response.get("model", "cached-model"),
+            },
+        ):
+            # Record 0 cost request in the ledger
+            store = ledger_queue if ledger_queue else ledger
+            await store.record_request(
+                api_key=api_key,
+                req_id=cached_response.get("id", f"cache-{uuid.uuid4()}"),
+                backend="cache",
+                model=cached_response.get("model", "cached-model"),
+                prompt_tokens=cached_response.get("usage", {}).get("prompt_tokens", 0),
+                comp_tokens=cached_response.get("usage", {}).get("completion_tokens", 0),
+                cost=0.0,
+                latency=0.0
+            )
         if is_stream:
             async def cached_stream_generator():
                 content = cached_response["choices"][0]["message"]["content"]
                 words = content.split(" ")
                 for i, word in enumerate(words):
                     space = " " if i > 0 else ""
+                    if vault_mapping:
+                        word = pii_vault.restore_text(word, vault_mapping)
                     chunk = {
                         "id": cached_response["id"],
                         "object": "chat.completion.chunk",
@@ -303,6 +437,14 @@ async def chat_completions(request: Request, response: Response, api_key: str = 
                 yield f"data: {json.dumps(final_chunk)}\n\n"
                 yield "data: [DONE]\n\n"
             return StreamingResponse(cached_stream_generator(), media_type="text/event-stream")
+        if vault_mapping:
+            # Restore on a copy — the cache entry must stay in masked form so
+            # future hits restore against their own request's mapping.
+            cached_response = json.loads(json.dumps(cached_response))
+            for choice in cached_response.get("choices", []):
+                message = choice.get("message", {})
+                if message.get("content"):
+                    message["content"] = pii_vault.restore_text(message["content"], vault_mapping)
         return cached_response
 
     observe_cache(hit=False)
@@ -333,101 +475,253 @@ async def chat_completions(request: Request, response: Response, api_key: str = 
         else:
             estimated_cost = 0.0
             
-        await budget_policy.check_preflight(api_key, estimated_cost=estimated_cost)
+        await budget_policy.check_and_reserve(api_key, estimated_cost=estimated_cost)
     except BudgetExceededException as e:
         raise HTTPException(status_code=429, detail=str(e))
         
     if is_stream:
+        _store = ledger_queue if ledger_queue else ledger
+
         async def stream_generator():
             accumulated_text = ""
             last_chunk = None
-            try:
-                kwargs["api_key"] = api_key
-                async for chunk in router.execute_stream(sanitized_messages, **kwargs):
-                    last_chunk = chunk
-                    choices = chunk.get("choices", [])
-                    if choices:
-                        delta = choices[0].get("delta", {})
-                        content = delta.get("content", "")
-                        if content:
-                            accumulated_text += content
-                    yield f"data: {json.dumps(chunk)}\n\n"
-                
-                # Cache the finished streaming response
-                if last_chunk:
-                    cached_response_dict = {
-                        "id": last_chunk.get("id", f"cache-{uuid.uuid4()}"),
-                        "object": "chat.completion",
-                        "created": int(time.time()),
-                        "model": last_chunk.get("model", "model-stream"),
-                        "choices": [{
-                            "message": {
-                                "role": "assistant",
-                                "content": accumulated_text
-                            },
-                            "finish_reason": "stop"
-                        }],
-                        "usage": {
-                            "prompt_tokens": 0,
-                            "completion_tokens": 0,
-                            "total_tokens": 0
-                        }
-                    }
-                    prompt_cache.set(sanitized_messages, kwargs, cached_response_dict)
-                yield "data: [DONE]\n\n"
-            except Exception as e:
-                logging.error(f"Streaming error: {e}")
-                yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'gateway_error'}})}\n\n"
-                yield "data: [DONE]\n\n"
-        return StreamingResponse(stream_generator(), media_type="text/event-stream")
-        
-    try:
-        backend_response = await router.execute(sanitized_messages, **kwargs)
-        observe_request(backend_response.backend_id, "success", backend_response.latency_ms, backend_response.cost_usd)
-    except NoAvailableBackendException as e:
-        observe_request("unknown", "error", 0.0, 0.0)
-        raise HTTPException(status_code=503, detail=str(e))
-    except Exception as e:
-        observe_request("unknown", "error", 0.0, 0.0)
-        raise HTTPException(status_code=500, detail=f"Gateway internal error: {str(e)}")
-        
-    # Record spend
-    store = ledger_queue if ledger_queue else ledger
-    await store.record_request(
-        api_key=api_key,
-        req_id=request_id,
-        backend=backend_response.backend_id,
-        model=backend_response.model,
-        prompt_tokens=backend_response.prompt_tokens,
-        comp_tokens=backend_response.completion_tokens,
-        cost=backend_response.cost_usd,
-        latency=backend_response.latency_ms
-    )
-    
-    response_dict = {
-        "id": backend_response.id,
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": backend_response.model,
-        "choices": [
-            {
-                "index": i,
-                "message": {
-                    "role": msg.role,
-                    "content": msg.content
+            stream_backend_id = "unknown"
+            stream_model = "unknown"
+            guardrail_flagged = False
+            stream_start = time.time()
+
+            with GatewayTracer.trace_span(
+                "chat.completion.stream",
+                attributes={
+                    "api_key_hash": _key_hash(api_key),
+                    "request_id": request_id,
+                    "stream": True,
+                    "cache_hit": False,
                 },
-                "finish_reason": "stop"
+            ) as span:
+                try:
+                    kwargs["api_key"] = api_key
+                    async for chunk in router.execute_stream(sanitized_messages, **kwargs):
+                        last_chunk = chunk
+                        masked_delta, outgoing = _finalize_stream_chunk(chunk, vault_mapping)
+                        if masked_delta:
+                            accumulated_text += masked_delta
+                        # Capture backend/model from the first chunk that has them
+                        if chunk.get("model") and stream_model == "unknown":
+                            stream_model = chunk["model"]
+                        if chunk.get("_backend_id") and stream_backend_id == "unknown":
+                            stream_backend_id = chunk["_backend_id"]
+                        yield f"data: {json.dumps(outgoing)}\n\n"
+
+                    # ── Output guardrail validation on the full completion ────
+                    try:
+                        if guardrails_pipeline:
+                            guardrails_pipeline.validate_completion(accumulated_text)
+                    except GuardrailViolationException as e:
+                        # Chunks were already streamed to the client; flag so
+                        # the completion is not cached and the event is auditable.
+                        guardrail_flagged = True
+                        logging.warning(f"{e} (request {request_id})")
+
+                    # ── Spend recording ────────────────────────────────────────
+                    latency_ms = (time.time() - stream_start) * 1000.0
+
+                    prompt_tokens_count, completion_tokens_count = _count_tokens(
+                        sanitized_messages, accumulated_text
+                    )
+                    completion_tokens_count = max(1, completion_tokens_count)
+
+                    # Use estimated_cost as actual cost for streams (no usage object)
+                    # because we reserved it upfront; delta will be 0.
+                    actual_cost = estimated_cost
+
+                    observe_request(stream_backend_id, "success", latency_ms, actual_cost)
+
+                    await _store.record_request(
+                        api_key=api_key,
+                        req_id=request_id,          # gateway UUID, not a backend chunk id
+                        backend=stream_backend_id,
+                        model=stream_model,
+                        prompt_tokens=prompt_tokens_count,
+                        comp_tokens=completion_tokens_count,
+                        cost=actual_cost,
+                        latency=latency_ms,
+                        reserved_cost=estimated_cost,  # reconcile pre-reservation
+                    )
+
+                    if span:
+                        span.set_attribute("backend_id", stream_backend_id)
+                        span.set_attribute("model", stream_model)
+                        span.set_attribute("cost_usd", actual_cost)
+                        span.set_attribute("guardrail_flagged", guardrail_flagged)
+
+                    # Cache the finished streaming response (masked form, never
+                    # cache guardrail-flagged completions)
+                    if last_chunk and not guardrail_flagged:
+                        cached_response_dict = {
+                            "id": last_chunk.get("id", f"cache-{uuid.uuid4()}"),
+                            "object": "chat.completion",
+                            "created": int(time.time()),
+                            "model": stream_model,
+                            "choices": [{
+                                "message": {
+                                    "role": "assistant",
+                                    "content": accumulated_text,
+                                },
+                                "finish_reason": "stop",
+                            }],
+                            "usage": {
+                                "prompt_tokens": prompt_tokens_count,
+                                "completion_tokens": completion_tokens_count,
+                                "total_tokens": prompt_tokens_count + completion_tokens_count,
+                            },
+                        }
+                        prompt_cache.set(sanitized_messages, kwargs, cached_response_dict)
+
+                    yield "data: [DONE]\n\n"
+
+                except asyncio.TimeoutError as e:
+                    latency_ms = (time.time() - stream_start) * 1000.0
+                    observe_request(stream_backend_id, "error", latency_ms, 0.0)
+                    logging.error(f"Streaming timeout: {e}")
+                    try:
+                        p_tok, c_tok = _count_tokens(sanitized_messages, accumulated_text)
+                        # Record the partial spend so record_request reconciles
+                        # (releases) the amount reserved in the preflight check.
+                        await _store.record_request(
+                            api_key=api_key,
+                            req_id=request_id,
+                            backend=stream_backend_id,
+                            model=stream_model,
+                            prompt_tokens=p_tok,
+                            comp_tokens=c_tok,
+                            cost=_adapter_cost(stream_backend_id, p_tok, c_tok),
+                            latency=latency_ms,
+                            reserved_cost=estimated_cost,
+                        )
+                    except Exception as ledger_err:
+                        logging.error(f"Failed to reconcile streaming budget reservation: {ledger_err}")
+                    yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'gateway_timeout'}})}\n\n"
+                    yield "data: [DONE]\n\n"
+                except Exception as e:
+                    latency_ms = (time.time() - stream_start) * 1000.0
+                    observe_request(stream_backend_id, "error", latency_ms, 0.0)
+                    logging.error(f"Streaming error: {e}")
+                    try:
+                        p_tok, c_tok = _count_tokens(sanitized_messages, accumulated_text)
+                        await _store.record_request(
+                            api_key=api_key,
+                            req_id=request_id,
+                            backend=stream_backend_id,
+                            model=stream_model,
+                            prompt_tokens=p_tok,
+                            comp_tokens=c_tok,
+                            cost=_adapter_cost(stream_backend_id, p_tok, c_tok),
+                            latency=latency_ms,
+                            reserved_cost=estimated_cost,
+                        )
+                    except Exception as ledger_err:
+                        logging.error(f"Failed to reconcile streaming budget reservation: {ledger_err}")
+                    yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'gateway_error'}})}\n\n"
+                    yield "data: [DONE]\n\n"
+
+        return StreamingResponse(stream_generator(), media_type="text/event-stream")
+
+        
+    with GatewayTracer.trace_span(
+        "chat.completion",
+        attributes={
+            "api_key_hash": _key_hash(api_key),
+            "request_id": request_id,
+            "stream": False,
+            "cache_hit": False,
+        },
+    ) as span:
+        try:
+            backend_response = await router.execute(sanitized_messages, **kwargs)
+            observe_request(backend_response.backend_id, "success", backend_response.latency_ms, backend_response.cost_usd)
+        except NoAvailableBackendException as e:
+            observe_request("unknown", "error", 0.0, 0.0)
+            raise HTTPException(status_code=503, detail=str(e))
+        except asyncio.TimeoutError as e:
+            observe_request("unknown", "error", 0.0, 0.0)
+            raise HTTPException(status_code=504, detail=f"Gateway timeout: {str(e)}")
+        except Exception as e:
+            observe_request("unknown", "error", 0.0, 0.0)
+            raise HTTPException(status_code=500, detail=f"Gateway internal error: {str(e)}")
+
+        # Record spend
+        store = ledger_queue if ledger_queue else ledger
+        await store.record_request(
+            api_key=api_key,
+            req_id=request_id,
+            backend=backend_response.backend_id,
+            model=backend_response.model,
+            prompt_tokens=backend_response.prompt_tokens,
+            comp_tokens=backend_response.completion_tokens,
+            cost=backend_response.cost_usd,
+            latency=backend_response.latency_ms,
+            reserved_cost=estimated_cost
+        )
+
+        # Output guardrails: redact leaked secrets on the masked text, then
+        # reject the response if the model regurgitated its instructions.
+        sanitized_contents = [
+            guardrails_pipeline.sanitize_completion(m.content) if guardrails_pipeline else m.content
+            for m in backend_response.messages
+        ]
+        if guardrails_pipeline:
+            try:
+                guardrails_pipeline.validate_completion("\n".join(sanitized_contents))
+            except GuardrailViolationException as e:
+                if span:
+                    span.set_attribute("guardrail_violation", True)
+                raise HTTPException(status_code=400, detail=str(e))
+
+        if span:
+            span.set_attribute("backend_id", backend_response.backend_id)
+            span.set_attribute("model", backend_response.model)
+            span.set_attribute("cost_usd", backend_response.cost_usd)
+
+        response_dict = {
+            "id": backend_response.id,
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": backend_response.model,
+            "choices": [
+                {
+                    "index": i,
+                    "message": {
+                        "role": msg.role,
+                        "content": content
+                    },
+                    "finish_reason": "stop"
+                }
+                for i, (msg, content) in enumerate(zip(backend_response.messages, sanitized_contents))
+            ],
+            "usage": {
+                "prompt_tokens": backend_response.prompt_tokens,
+                "completion_tokens": backend_response.completion_tokens,
+                "total_tokens": backend_response.prompt_tokens + backend_response.completion_tokens
             }
-            for i, msg in enumerate(backend_response.messages)
-        ],
-        "usage": {
-            "prompt_tokens": backend_response.prompt_tokens,
-            "completion_tokens": backend_response.completion_tokens,
-            "total_tokens": backend_response.prompt_tokens + backend_response.completion_tokens
         }
-    }
-    
-    # Save to cache
-    prompt_cache.set(sanitized_messages, kwargs, response_dict)
-    
-    return response_dict
+
+        # Save to cache in masked form — future cache hits restore against
+        # their own request's vault mapping. Deep copy: PromptCache stores by
+        # reference and the dict is restored in place below.
+        prompt_cache.set(sanitized_messages, kwargs, json.loads(json.dumps(response_dict)))
+
+        # Restore the caller's PII on the returned response
+        if vault_mapping:
+            response_dict["choices"] = [
+                {
+                    **choice,
+                    "message": {
+                        **choice["message"],
+                        "content": pii_vault.restore_text(choice["message"]["content"], vault_mapping),
+                    },
+                }
+                for choice in response_dict["choices"]
+            ]
+
+        return response_dict
