@@ -48,7 +48,8 @@ async def test_dynamic_auth_and_rate_limits():
     tok = await verify_api_key("sk-key-high")
     assert tok == "sk-key-high"
 
-def test_admin_patch_budget_limits_and_rate_limits():
+def test_admin_patch_budget_limits_and_rate_limits(monkeypatch):
+    monkeypatch.setenv("ADMIN_API_KEY", "test-secure-admin-key")
     # Use context manager to trigger ASGI lifespan
     with TestClient(app) as client:
         # Patch/Update limits for a new key via Admin API
@@ -59,7 +60,7 @@ def test_admin_patch_budget_limits_and_rate_limits():
         }
         resp = client.patch(
             "/admin/budgets/sk-key-admin-test",
-            headers={"X-Admin-Token": "admin-default-secret"},
+            headers={"X-Admin-Token": "test-secure-admin-key"},
             json=payload
         )
         assert resp.status_code == 200
@@ -68,3 +69,24 @@ def test_admin_patch_budget_limits_and_rate_limits():
         # Verify changes propagated in-place to memory auth collections
         assert "sk-key-admin-test" in VALID_API_KEYS
         assert RATE_LIMIT_RULES["sk-key-admin-test"] == 12
+
+def test_admin_auth_rejection_and_unconfigured(monkeypatch):
+    monkeypatch.setenv("ADMIN_API_KEY", "test-secure-admin-key")
+    with TestClient(app) as client:
+        # Request with wrong admin key should be rejected with 401
+        resp = client.get("/admin/budgets", headers={"X-Admin-Token": "wrong-key"})
+        assert resp.status_code == 401
+        assert "Unauthorized Admin access" in resp.json()["detail"]
+
+        # Request with missing header should be rejected with 401
+        resp = client.get("/admin/budgets")
+        assert resp.status_code == 401
+        assert "Unauthorized Admin access" in resp.json()["detail"]
+
+    # When ADMIN_API_KEY is not set in environment, fail-closed with 500
+    monkeypatch.delenv("ADMIN_API_KEY", raising=False)
+    with TestClient(app) as client:
+        resp = client.get("/admin/budgets", headers={"X-Admin-Token": "test-secure-admin-key"})
+        assert resp.status_code == 500
+        assert "ADMIN_API_KEY environment variable is not configured" in resp.json()["detail"]
+

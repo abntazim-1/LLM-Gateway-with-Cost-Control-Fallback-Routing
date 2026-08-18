@@ -45,7 +45,8 @@ class AsyncLedgerQueue:
         prompt_tokens: int, 
         comp_tokens: int, 
         cost: float, 
-        latency: float
+        latency: float,
+        reserved_cost: float = 0.0
     ):
         """Enqueue request payload for background processing without blocking."""
         item = {
@@ -56,7 +57,8 @@ class AsyncLedgerQueue:
             "prompt_tokens": prompt_tokens,
             "comp_tokens": comp_tokens,
             "cost": cost,
-            "latency": latency
+            "latency": latency,
+            "reserved_cost": reserved_cost
         }
         try:
             self.queue.put_nowait(item)
@@ -82,7 +84,8 @@ class AsyncLedgerQueue:
                         prompt_tokens=item["prompt_tokens"],
                         comp_tokens=item["comp_tokens"],
                         cost=item["cost"],
-                        latency=item["latency"]
+                        latency=item["latency"],
+                        reserved_cost=item.get("reserved_cost", 0.0)
                     )
                 except Exception as e:
                     logger.error(f"Error persisting ledger queue item: {e}")
