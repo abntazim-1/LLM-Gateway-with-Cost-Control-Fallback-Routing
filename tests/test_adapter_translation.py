@@ -38,3 +38,42 @@ def test_openai_clean_kwargs():
     }
     cleaned = ParameterTransformer.openai_clean_kwargs(kwargs)
     assert cleaned == {"temperature": 0.5, "max_tokens": 100}
+
+@pytest.mark.asyncio
+async def test_adapter_client_close():
+    from gateway.adapters.local_vllm_adapter import LocalVLLMAdapter
+    cfg = {"id": "test-vllm", "provider": "local_vllm", "model": "qwen", "endpoint": "http://localhost:11434/v1"}
+    adapter = LocalVLLMAdapter(cfg)
+    assert not adapter.client.is_closed
+
+    await adapter.close()
+    assert adapter.client.is_closed
+
+@pytest.mark.asyncio
+async def test_adapter_async_context_manager():
+    from gateway.adapters.local_vllm_adapter import LocalVLLMAdapter
+    cfg = {"id": "test-vllm", "provider": "local_vllm", "model": "qwen", "endpoint": "http://localhost:11434/v1"}
+    async with LocalVLLMAdapter(cfg) as adapter:
+        assert not adapter.client.is_closed
+    assert adapter.client.is_closed
+
+@pytest.mark.asyncio
+async def test_router_close_all_adapters():
+    from gateway.adapters.local_vllm_adapter import LocalVLLMAdapter
+    from gateway.policy.router import Router
+    from gateway.policy.circuit_breaker import CircuitBreakerRegistry
+    from gateway.ledger.store import LedgerStore
+
+    ledger = LedgerStore(":memory:")
+    registry = CircuitBreakerRegistry(ledger=ledger)
+    a1 = LocalVLLMAdapter({"id": "vllm-1", "provider": "local_vllm", "model": "m1", "endpoint": "http://localhost:11434/v1"})
+    a2 = LocalVLLMAdapter({"id": "vllm-2", "provider": "local_vllm", "model": "m2", "endpoint": "http://localhost:11434/v1"})
+
+    router = Router(adapters=[a1, a2], circuit_registry=registry)
+    assert not a1.client.is_closed
+    assert not a2.client.is_closed
+
+    await router.close()
+    assert a1.client.is_closed
+    assert a2.client.is_closed
+

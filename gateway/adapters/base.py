@@ -32,6 +32,17 @@ class BaseAdapter(ABC):
         import httpx
         self.client = httpx.AsyncClient(limits=httpx.Limits(max_keepalive_connections=20))
         
+    async def close(self) -> None:
+        """Close underlying httpx.AsyncClient session and release connection pool / file descriptors."""
+        if hasattr(self, "client") and self.client is not None:
+            await self.client.aclose()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()
+
     def _calculate_cost(self, prompt_tokens: int, completion_tokens: int) -> float:
         prompt_cost = (prompt_tokens / 1000.0) * self.cost_per_1k_prompt
         completion_cost = (completion_tokens / 1000.0) * self.cost_per_1k_completion
