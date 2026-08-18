@@ -1,4 +1,5 @@
 circuit_breaker:
   failure_threshold: 3
   cooldown_period_sec: 30
-  request_timeout_sec: 10.0
+  request_timeout_sec: 60.0
+

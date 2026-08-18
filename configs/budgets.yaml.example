@@ -1,0 +1,12 @@
+# Example Client Budgets Configuration
+# Real keys should be passed via environment variables (e.g. ${CLIENT_API_KEY_1})
+budgets:
+  - api_key: "${CLIENT_API_KEY_TIER1}"
+    daily_limit_usd: 1.00
+    monthly_limit_usd: 20.00
+    requests_per_minute: 60
+
+  - api_key: "${CLIENT_API_KEY_DEMO}"
+    daily_limit_usd: 5.00
+    monthly_limit_usd: 50.00
+    requests_per_minute: 120

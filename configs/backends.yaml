@@ -1,30 +1,21 @@
 backends:
-  - id: local-ollama-qwen2.5-0.5b
-    provider: local_vllm
-    model: qwen2.5:0.5b
-    endpoint: "http://localhost:11434/v1"
-    cost_per_1k_prompt: 0.0020
-    cost_per_1k_completion: 0.00015 
-    capabilities:
-      - json_mode
-    context_length: 8192
-
-  - id: local-ollama-llama3.2-3b
-    provider: local_vllm
-    model: llama3.2:3b
-    endpoint: "http://localhost:11434/v1"
-    cost_per_1k_prompt: 0.00020
-    cost_per_1k_completion: 0.00025
-    capabilities:
-      - json_mode
-    context_length: 8192
-
   - id: local-ollama-phi3
-    provider: local_vllm
+    provider: ollama
     model: phi3:latest
     endpoint: "http://localhost:11434/v1"
-    cost_per_1k_prompt: 0.000001
-    cost_per_1k_completion: 0.000002
+    cost_per_1k_prompt: 0.0001
+    cost_per_1k_completion: 0.0002
     capabilities:
       - json_mode
     context_length: 8192
+
+  - id: local-ollama-qwen2.5-0.5b
+    provider: ollama
+    model: qwen2.5:0.5b
+    endpoint: "http://localhost:11434/v1"
+    cost_per_1k_prompt: 0.0010
+    cost_per_1k_completion: 0.0020
+    capabilities:
+      - json_mode
+    context_length: 8192
+

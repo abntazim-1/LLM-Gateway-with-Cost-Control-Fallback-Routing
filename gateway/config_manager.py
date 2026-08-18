@@ -29,7 +29,7 @@ class ConfigManager:
                 adapters.append(OpenAIAdapter(cfg))
             elif provider == "anthropic":
                 adapters.append(AnthropicAdapter(cfg))
-            elif provider == "local_vllm":
+            elif provider in ("local_vllm", "ollama"):
                 adapters.append(LocalVLLMAdapter(cfg))
             else:
                 logger.warning(f"Unknown backend provider '{provider}' in configuration.")
@@ -44,7 +44,17 @@ class ConfigManager:
         return routing_cfg.get("strategy", "cost_first")
 
     def load_budgets(self) -> list:
+        raw_env = os.environ.get("GATEWAY_BUDGETS_JSON") or os.environ.get("GATEWAY_BUDGETS")
+        if raw_env:
+            try:
+                import json
+                parsed = json.loads(raw_env)
+                return parsed.get("budgets", parsed) if isinstance(parsed, dict) else parsed
+            except Exception as e:
+                logger.error(f"Failed to parse GATEWAY_BUDGETS environment variable: {e}")
+
         budgets_path = os.path.join(self.config_dir, "budgets.yaml")
         if not os.path.exists(budgets_path):
             return []
         return load_config(budgets_path).get("budgets", [])
+

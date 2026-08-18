@@ -25,9 +25,10 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
-
-# Environment
+docs/
+# Environment & secrets
 .env
+.env.*
 .venv
 env/
 venv/
@@ -40,7 +41,4 @@ venv.bak/
 *.sqlite3
 *.db
 *.db-wal
-*.db-shm
-docs/$env:ANTHROPIC_AUTH_TOKEN="sk-QHsF84wxcTaMJFQnuRm4Szs40UYWW1ijw2Ho6LvXTK4PZbsG"
-$env:ANTHROPIC_BASE_URL="https://agentrouter.org"
-$env:ANTHROPIC_MODEL="claude-opus-4.6"
+*.db-shm.zcode/

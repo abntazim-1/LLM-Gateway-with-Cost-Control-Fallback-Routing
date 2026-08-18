@@ -1,4 +1,6 @@
 routing:
-  strategy: cost_first  # cost_first, latency_first, capability
+  strategy: cost_first  # cost_first, latency_first, complexity, round_robin
   fallback_enabled: true
   max_retries: 2
+  min_tokens_for_complex: 500
+
