@@ -85,9 +85,18 @@ with tab1:
             type="password",
         )
     with col2:
+        # Was labelled "Target Model Heuristic" and pre-filled with a model
+        # name, which read like a hint the router would weigh. It is actually
+        # a hard override — naming it that way meant every sandbox request
+        # silently bypassed cost routing and pinned one backend.
         model_name = st.text_input(
-            "Target Model Heuristic",
-            value=os.environ.get("DEFAULT_MODEL", "qwen2.5:0.5b"),
+            "Force Model (blank = auto-route)",
+            value=os.environ.get("DEFAULT_MODEL", ""),
+            placeholder="auto",
+            help="Leave blank to let the gateway choose a backend using the "
+            "configured routing strategy. Naming a model here overrides "
+            "routing entirely and pins the request to that backend, "
+            "regardless of cost.",
         )
     with col3:
         max_tokens = st.number_input(
@@ -136,20 +145,26 @@ with tab1:
             message_placeholder = st.empty()
             try:
                 full_response = ""
+                payload = {
+                    # Only the recent window is re-sent. The full conversation
+                    # is still rendered above; sending all of it every turn
+                    # re-bills every prior message, so total session cost
+                    # grows with the square of its length.
+                    "messages": st.session_state.messages[-history_limit:],
+                    "stream": True,
+                    "max_tokens": max_tokens,
+                }
+                # Omitted entirely when blank, so the gateway routes normally.
+                # Sending an empty string would look like a request for a
+                # backend named "".
+                if model_name.strip():
+                    payload["model"] = model_name.strip()
+
                 with httpx.stream(
                     "POST",
                     f"{gateway_url}/v1/chat/completions",
                     headers={"Authorization": f"Bearer {api_key}"},
-                    json={
-                        "model": model_name,
-                        # Only the recent window is re-sent. The full
-                        # conversation is still rendered above; sending all of
-                        # it every turn re-bills every prior message, so total
-                        # session cost grows with the square of its length.
-                        "messages": st.session_state.messages[-history_limit:],
-                        "stream": True,
-                        "max_tokens": max_tokens,
-                    },
+                    json=payload,
                     timeout=60.0,
                 ) as r:
                     if r.status_code != 200:

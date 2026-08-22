@@ -3,36 +3,44 @@
 # any default system block baked into the model's template). It is measured
 # per model — re-derive with `python docs/probes/probe_tokens.py` after adding
 # or changing a backend.
+#
+# Prices below are illustrative rates for these local models, set so that cost
+# tracks model size the way hosted pricing does. They previously had the small
+# model priced ten times above the large one, which made every routing
+# decision land on the same backend and hid what the router was doing.
+#
+# capability_tier is declared separately from price on purpose: routing that
+# wants "the better model" ranks on capability, not cost. The two usually
+# correlate — as they do here — but nothing guarantees it, and when they
+# diverge, ranking by price picks the weaker model.
 backends:
-  - id: local-ollama-phi3
-    provider: ollama
-    model: phi3:latest
-    endpoint: "http://localhost:11434/v1"
-    cost_per_1k_prompt: 0.0001
-    cost_per_1k_completion: 0.0002
-    tokenizer: cl100k_base
-    token_overhead_per_message: 7
-    # 3.8B parameters — the more capable of the two local models, despite
-    # being priced lower. Routing that wants "the better model" ranks on this
-    # rather than on price, which would pick the weaker one here.
-    capability_tier: 2
-    capabilities:
-      - json_mode
-    context_length: 8192
-
+  # Small and cheap. The default destination for routine traffic.
   - id: local-ollama-qwen2.5-0.5b
     provider: ollama
     model: qwen2.5:0.5b
     endpoint: "http://localhost:11434/v1"
-    cost_per_1k_prompt: 0.0010
-    cost_per_1k_completion: 0.0020
+    cost_per_1k_prompt: 0.00005
+    cost_per_1k_completion: 0.00010
     tokenizer: cl100k_base
     # Qwen's template ships a default system block, so its fixed overhead is
     # far larger than the OpenAI-style default of 4.
     token_overhead_per_message: 26
-    # 0.5B parameters — the weaker model, even though it is priced higher.
     capability_tier: 1
     capabilities:
       - json_mode
     context_length: 8192
 
+  # ~8x the parameters, and priced accordingly. Reserved for requests the
+  # router judges to need it.
+  - id: local-ollama-phi3
+    provider: ollama
+    model: phi3:latest
+    endpoint: "http://localhost:11434/v1"
+    cost_per_1k_prompt: 0.00040
+    cost_per_1k_completion: 0.00080
+    tokenizer: cl100k_base
+    token_overhead_per_message: 7
+    capability_tier: 2
+    capabilities:
+      - json_mode
+    context_length: 8192
