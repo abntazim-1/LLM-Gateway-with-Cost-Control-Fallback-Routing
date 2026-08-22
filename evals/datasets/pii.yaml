@@ -1,0 +1,81 @@
+# PII detection and masking.
+#
+# `expect_labels` lists the placeholder labels that must appear. An empty list
+# means nothing should be masked — false positives are graded here too,
+# because masking rewrites the prompt before the model sees it, so a wrong
+# match silently changes the question being asked.
+suite: pii
+description: Reversible PII masking — recall on real identifiers, precision on ordinary text.
+
+cases:
+  # ── Structured identifiers ───────────────────────────────────────────
+  - id: email-standard
+    text: "contact me at jane.doe@example.com"
+    expect_labels: [EMAIL]
+  - id: email-obfuscated
+    text: "contact me at jane.doe [at] example [dot] com"
+    expect_labels: [EMAIL_OBFUSCATED]
+  - id: email-spaced
+    text: "contact me at jane . doe @ example.com"
+    expect_labels: [EMAIL_SPACED]
+  - id: ssn-dashed
+    text: "SSN 123-45-6789"
+    expect_labels: [SSN]
+  - id: ssn-spaced
+    text: "SSN 123 45 6789"
+    expect_labels: [SSN]
+  - id: ip-address
+    text: "my server is at 192.168.14.201"
+    expect_labels: [IP_ADDRESS]
+  - id: date-of-birth
+    text: "I was born on 14 March 1988"
+    expect_labels: [DOB]
+  - id: passport
+    text: "My passport number is X4429871"
+    expect_labels: [PASSPORT]
+  - id: iban
+    text: "IBAN GB29 NWBK 6016 1331 9268 19"
+    expect_labels: [IBAN]
+  - id: credit-card-valid
+    text: "card 4111 1111 1111 1111 expires soon"
+    expect_labels: [CREDIT_CARD]
+  - id: aws-key
+    text: "key AKIAIOSFODNN7EXAMPLE here"
+    expect_labels: [AWS_KEY]
+
+  # ── Must NOT be masked ───────────────────────────────────────────────
+  - id: fp-order-number
+    text: "My order number is 1234567890123456"
+    expect_labels: []
+    note: 16 digits but fails Luhn, so not a card number.
+  - id: fp-long-integer
+    text: "The result was 4815162342236"
+    expect_labels: []
+  - id: fp-plain-prose
+    text: "Please summarise the attached document."
+    expect_labels: []
+  - id: fp-version-numbers
+    text: "Upgrade from 1.2.3 to 4.5.6 before Tuesday"
+    expect_labels: []
+  - id: fp-medical-figure
+    text: "type 2 diabetes affects 400 million people"
+    expect_labels: []
+
+  # ── Free-text PII (known gap) ────────────────────────────────────────
+  - id: person-name
+    text: "My name is Jonathan Michael Abernathy"
+    expect_labels: [PERSON]
+    known_gap: true
+    note: >
+      Names have no distinctive lexical shape, so regex cannot find them.
+      Requires NER (F6 residual). GDPR-relevant.
+  - id: street-address
+    text: "I live at 4417 Maplewood Drive, Springfield IL 62704"
+    expect_labels: [ADDRESS]
+    known_gap: true
+    note: Requires NER (F6 residual). GDPR-relevant.
+  - id: medical-condition
+    text: "I was diagnosed with type 2 diabetes last year"
+    expect_labels: [MEDICAL]
+    known_gap: true
+    note: Requires NER (F6 residual). HIPAA-relevant.

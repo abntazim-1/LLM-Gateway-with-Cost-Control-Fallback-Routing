@@ -1,0 +1,83 @@
+# Complexity classification for the `complexity` routing strategy.
+#
+# `expect: complex` means the request should be routed to a more capable
+# backend; `simple` means the cheap one is sufficient. Getting this wrong is
+# expensive in both directions — a false "complex" wastes money, a false
+# "simple" degrades an answer that needed a better model.
+suite: routing
+description: Prompt complexity classification driving cost-aware model selection.
+
+cases:
+  # ── Should stay on the cheap backend ─────────────────────────────────
+  - id: greeting
+    text: "hi"
+    expect: simple
+  - id: factual-recall
+    text: "What is the capital of France?"
+    expect: simple
+  - id: simple-why
+    text: "Why is the sky blue?"
+    expect: simple
+    note: Recall phrased as a question, not analysis.
+  - id: definitions
+    text: "what is an algorithm and what is a proof"
+    expect: simple
+  - id: padded-filler
+    text: "hello hello hello hello hello hello hello hello hello hello hello
+      hello hello hello hello hello hello hello hello hello hello hello hello
+      hello hello hello hello hello hello hello hello hello hello hello hello"
+    expect: simple
+    note: Length without substance must not escalate.
+  - id: short-chitchat
+    text: "thanks, that helps!"
+    expect: simple
+
+  # ── Should escalate to a capable backend ─────────────────────────────
+  - id: multi-term-engineering
+    text: "Can you help me optimize and refactor this function, then benchmark
+      the performance improvement against the original implementation?"
+    expect: complex
+    note: >
+      Three domain terms. Previously scored as one because they shared a
+      single regex alternation group.
+  - id: causal-analysis-no-keywords
+    text: "Why would a two-tier cache produce stale reads under concurrent
+      writes?"
+    expect: complex
+    note: Hard question carried by framing rather than vocabulary.
+  - id: code-block
+    text: |
+      Review this code:
+      ```python
+      def solve(matrix):
+          return np.linalg.eig(matrix)
+      ```
+    expect: complex
+  - id: maths-proof
+    text: "Prove this theorem and analyse its time complexity and space
+      complexity."
+    expect: complex
+  - id: medical-decision
+    text: "Should carvedilol be titrated before or after starting
+      sacubitril/valsartan?"
+    expect: complex
+    note: Expert domain outside software.
+  - id: legal-analysis
+    text: "Compare the indemnification liability under each jurisdiction and
+      explain which statutory regime governs arbitration here."
+    expect: complex
+  - id: distributed-systems
+    text: "Under what conditions does sharding break read-after-write
+      consistency in a distributed system?"
+    expect: complex
+
+  # ── Known gap ────────────────────────────────────────────────────────
+  - id: unlisted-domain
+    text: "Is a fugue subject better answered with stretto or with a
+      countersubject in this exposition?"
+    expect: complex
+    known_gap: true
+    note: >
+      Music theory is not in the domain vocabulary. Lexical matching cannot
+      cover every field — this is the structural limit of F7's approach and
+      the reason `cascade` exists.

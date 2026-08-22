@@ -118,6 +118,29 @@ class LedgerStore(BaseLedgerStore):
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_rll_key_ts ON rate_limit_log (api_key, ts)"
             )
+            # Quality labels. Routing decisions in this gateway are otherwise
+            # unfalsifiable: nothing records whether the model that answered
+            # actually produced a good answer, so no routing change can be
+            # validated and a learned router has nothing to train on.
+            # Capturing a rating per request is the smallest thing that makes
+            # that measurable, and accumulates the labelled data such a router
+            # would need. See F13 in docs/AI_ML_FLAWS.md.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS feedback (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    request_id TEXT    NOT NULL,
+                    api_key    TEXT,
+                    backend    TEXT,
+                    model      TEXT,
+                    rating     INTEGER NOT NULL,
+                    comment    TEXT,
+                    timestamp  DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_feedback_request "
+                "ON feedback (request_id)"
+            )
             conn.commit()
 
     async def load_budgets_from_config(self, budgets_config: list):
@@ -343,6 +366,64 @@ class LedgerStore(BaseLedgerStore):
         rows = conn.execute(
             "SELECT id, api_key, backend, model, cost_usd, latency_ms, timestamp FROM requests ORDER BY timestamp DESC LIMIT ?",
             (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    async def record_feedback(
+        self,
+        request_id: str,
+        rating: int,
+        api_key: Optional[str] = None,
+        comment: Optional[str] = None,
+    ) -> None:
+        """Store a quality label for a request.
+
+        Backend and model are resolved from the ledger rather than trusted
+        from the caller, so a label is always attributed to whatever actually
+        answered — which is the point of collecting it.
+        """
+        await asyncio.to_thread(
+            self._record_feedback_sync, request_id, rating, api_key, comment
+        )
+
+    def _record_feedback_sync(
+        self,
+        request_id: str,
+        rating: int,
+        api_key: Optional[str],
+        comment: Optional[str],
+    ) -> None:
+        with self._write_lock:
+            conn = self._get_connection()
+            row = conn.execute(
+                "SELECT api_key, backend, model FROM requests WHERE id = ?",
+                (request_id,),
+            ).fetchone()
+            conn.execute(
+                "INSERT INTO feedback (request_id, api_key, backend, model, "
+                "rating, comment) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    request_id,
+                    (row["api_key"] if row else None) or api_key,
+                    row["backend"] if row else None,
+                    row["model"] if row else None,
+                    rating,
+                    comment,
+                ),
+            )
+            conn.commit()
+
+    async def get_feedback_summary(self) -> list:
+        """Per-backend rating counts — the beginnings of a quality signal."""
+        return await asyncio.to_thread(self._get_feedback_summary_sync)
+
+    def _get_feedback_summary_sync(self) -> list:
+        conn = self._get_connection()
+        rows = conn.execute(
+            "SELECT backend, model, COUNT(*) AS total, "
+            "SUM(CASE WHEN rating > 0 THEN 1 ELSE 0 END) AS positive, "
+            "SUM(CASE WHEN rating < 0 THEN 1 ELSE 0 END) AS negative "
+            "FROM feedback GROUP BY backend, model ORDER BY total DESC"
         ).fetchall()
         return [dict(r) for r in rows]
 

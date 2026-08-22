@@ -358,6 +358,45 @@ async def get_admin_requests(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/v1/feedback")
+async def submit_feedback(body: Dict[str, Any], api_key: str = Depends(verify_api_key)):
+    """Record a quality rating for a completed request.
+
+    Without this, nothing in the gateway records whether the model that
+    answered actually answered *well*, which makes every routing decision
+    unfalsifiable and leaves a learned router with nothing to train on.
+
+    Takes `request_id` (the X-Request-ID of the original call) and `rating`
+    (+1 / -1), with an optional free-text `comment`.
+    """
+    request_id = body.get("request_id")
+    rating = body.get("rating")
+    if not request_id:
+        raise HTTPException(status_code=400, detail="request_id is required")
+    if rating not in (1, -1):
+        raise HTTPException(status_code=400, detail="rating must be 1 or -1")
+
+    try:
+        await get_state().ledger.record_feedback(
+            request_id=str(request_id),
+            rating=int(rating),
+            api_key=api_key,
+            comment=body.get("comment"),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"status": "success"}
+
+
+@app.get("/admin/feedback")
+async def get_admin_feedback(admin_key: str = Depends(verify_admin_key)):
+    """Per-backend rating counts — the quality signal routing currently lacks."""
+    try:
+        return await get_state().ledger.get_feedback_summary()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/admin/circuit-breakers")
 async def get_admin_circuit_breakers(admin_key: str = Depends(verify_admin_key)):
     try:

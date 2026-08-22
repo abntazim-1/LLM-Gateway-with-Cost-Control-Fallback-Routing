@@ -1,0 +1,85 @@
+# Cascade escalation: did the cheap backend actually answer the request?
+#
+# `expect: escalate` means the reply is a non-answer and a more capable
+# backend should be tried; `keep` means the reply stands. Both errors cost
+# money: a false escalate pays twice for a good answer, a false keep ships a
+# bad one.
+suite: adequacy
+description: Response adequacy judging for the `cascade` routing strategy.
+
+cases:
+  # ── Adequate replies that must not escalate ──────────────────────────
+  - id: correct-terse-factual
+    prompt: "What is the capital of France?"
+    response: "Paris"
+    expect: keep
+    note: A correct terse answer must not be re-paid for.
+  - id: correct-terse-numeric
+    prompt: "What is 6 times 7?"
+    response: "42"
+    expect: keep
+  - id: correct-code
+    prompt: "Give me a list comprehension for even squares"
+    response: "x = [i**2 for i in range(10) if i % 2 == 0]"
+    expect: keep
+  - id: polite-opener-complete-answer
+    prompt: "My service is down"
+    response: "I'm sorry to hear that. Here is the complete fix: restart the
+      service and clear the stale lock file."
+    expect: keep
+    note: Politeness is not refusal.
+  - id: substantive-answer-to-substantive-ask
+    prompt: "Explain the water cycle in detail"
+    response: "Water evaporates from oceans and lakes under solar heating,
+      rises, cools and condenses into clouds, then returns as precipitation
+      before running off into rivers or infiltrating groundwater."
+    expect: keep
+
+  # ── Non-answers that must escalate ───────────────────────────────────
+  - id: explicit-refusal
+    prompt: "Summarise this document"
+    response: "I don't know."
+    expect: escalate
+  - id: capability-refusal
+    prompt: "Summarise this document"
+    response: "I'm unable to help with that."
+    expect: escalate
+  - id: empty-response
+    prompt: "Anything at all"
+    response: ""
+    expect: escalate
+  - id: terse-reply-to-substantive-ask
+    prompt: "Explain the water cycle in detail"
+    response: "It rains."
+    expect: escalate
+  - id: non-english-refusal
+    prompt: "Quelle est la capitale?"
+    response: "Je ne sais pas."
+    expect: escalate
+  - id: truncated
+    prompt: "Explain the water cycle in detail"
+    response: "The water cycle begins when solar radiation heats surface water
+      and causes it to"
+    finish_reason: length
+    expect: escalate
+    note: Truncation is hard evidence the backend stopped early.
+
+  # ── Known gaps: wrong answers are not detectable by surface signals ──
+  - id: confidently-wrong
+    prompt: "What is the capital of France?"
+    response: "The capital of France is Berlin, which has been the seat of
+      French government since the Treaty of Versailles was signed there in
+      1919."
+    expect: escalate
+    known_gap: true
+    note: >
+      Fluent, confident and entirely wrong. This is the failure mode that
+      matters most and no surface heuristic reaches it — it needs an
+      LLM-as-judge or the feedback loop this harness starts collecting.
+  - id: hallucinated-citation
+    prompt: "What was the effect size in the follow-up study?"
+    response: "According to Smith et al. (2019), the effect size was 0.83
+      across all cohorts."
+    expect: escalate
+    known_gap: true
+    note: Plausible fabricated citation — undetectable without verification.
