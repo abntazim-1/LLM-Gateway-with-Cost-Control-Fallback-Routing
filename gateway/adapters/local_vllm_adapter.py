@@ -72,6 +72,10 @@ class LocalVLLMAdapter(BaseAdapter):
                 "messages": messages,
                 "stream": True,
                 **ParameterTransformer.openai_clean_kwargs(kwargs),
+                # Ask the provider to append a final usage-bearing chunk.
+                # Streams otherwise carry no usage, forcing the gateway to
+                # bill from a local token estimate; this gives it ground truth.
+                "stream_options": {"include_usage": True},
             }
             async with self.client.stream(
                 "POST",

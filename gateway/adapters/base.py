@@ -51,6 +51,9 @@ class BaseAdapter(ABC):
         self.endpoint = config.get("endpoint", "")
         self.cost_per_1k_prompt = config.get("cost_per_1k_prompt", 0.0)
         self.cost_per_1k_completion = config.get("cost_per_1k_completion", 0.0)
+        # 0 / absent means "unknown", which is treated as unconstrained rather
+        # than as a zero-size window.
+        self.context_length = config.get("context_length", 0) or 0
         self.tokenizer_name = config.get("tokenizer", "cl100k_base")
         self.token_overhead_per_message = config.get(
             "token_overhead_per_message", DEFAULT_TOKEN_OVERHEAD_PER_MESSAGE

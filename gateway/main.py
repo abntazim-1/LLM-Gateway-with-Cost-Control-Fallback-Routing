@@ -36,7 +36,11 @@ from gateway.policy.cache import PromptCache
 from gateway.policy.circuit_breaker import CircuitBreakerRegistry
 from gateway.policy.guardrails import GuardrailsPipeline, GuardrailViolationException
 from gateway.policy.pii import PiiSanitizer, PiiVault
-from gateway.policy.router import NoAvailableBackendException, Router
+from gateway.policy.router import (
+    ContextLengthExceededException,
+    NoAvailableBackendException,
+    Router,
+)
 from gateway.telemetry.metrics import observe_cache, observe_request
 from gateway.telemetry.tracer import GatewayTracer
 
@@ -576,6 +580,14 @@ async def chat_completions(
             target_adapter = ranked_adapters[0] if ranked_adapters else None
         except NoAvailableBackendException:
             target_adapter = None
+        except ContextLengthExceededException as e:
+            # Fail fast: no backend can fit this request, so retrying or
+            # failing over cannot help. 400 matches the OpenAI convention for
+            # context_length_exceeded. This runs before the streaming/
+            # non-streaming split, so both get a clean error response rather
+            # than a 200 stream that immediately errors.
+            observe_request("unknown", "error", 0.0, 0.0)
+            raise HTTPException(status_code=400, detail=str(e))
 
         if target_adapter:
             prompt_tokens = target_adapter.count_prompt_tokens(sanitized_messages)
@@ -611,6 +623,7 @@ async def chat_completions(
             guardrail_flagged = False
             stream_start = time.time()
             backend_info: Dict[str, str] = {}
+            stream_usage: Dict[str, int] = {}
             reconciled = False
 
             with GatewayTracer.trace_span(
@@ -642,6 +655,11 @@ async def chat_completions(
                         stream_backend_id = backend_info.get(
                             "backend_id", stream_backend_id
                         )
+                        # Providers that support it append a final usage-bearing
+                        # chunk; that is ground truth and beats any local
+                        # estimate, so keep it if it arrives.
+                        if chunk.get("usage"):
+                            stream_usage = chunk["usage"]
                         yield f"data: {json.dumps(outgoing)}\n\n"
 
                     # ── Output guardrail validation on the full completion ────
@@ -656,16 +674,28 @@ async def chat_completions(
                     # ── Spend recording ────────────────────────────────────────
                     latency_ms = (time.time() - stream_start) * 1000.0
 
-                    serving_adapter = _find_adapter(state.router, stream_backend_id)
-                    prompt_tokens_count, completion_tokens_count = _count_tokens(
-                        sanitized_messages, accumulated_text, adapter=serving_adapter
-                    )
+                    # Prefer the provider's own usage when the backend reports
+                    # it (OpenAI-compatible `stream_options.include_usage`,
+                    # or Anthropic's message_delta, normalized by the adapter).
+                    # Fall back to counting the accumulated text locally for
+                    # backends that report nothing. Either way, bill for what
+                    # was generated — billing the reservation instead (sized to
+                    # max_tokens) charged every stream its ceiling regardless
+                    # of how little it produced.
+                    if stream_usage:
+                        prompt_tokens_count = stream_usage.get("prompt_tokens", 0)
+                        completion_tokens_count = stream_usage.get(
+                            "completion_tokens", 0
+                        )
+                    else:
+                        serving_adapter = _find_adapter(state.router, stream_backend_id)
+                        prompt_tokens_count, completion_tokens_count = _count_tokens(
+                            sanitized_messages,
+                            accumulated_text,
+                            adapter=serving_adapter,
+                        )
                     completion_tokens_count = max(1, completion_tokens_count)
 
-                    # Streams carry no usage object, so bill from what was
-                    # actually generated. Billing the reservation instead
-                    # (which is sized to max_tokens) charged every stream its
-                    # ceiling regardless of how little it produced.
                     actual_cost = _adapter_cost(
                         state.router,
                         stream_backend_id,
@@ -839,6 +869,9 @@ async def chat_completions(
                 backend_response.latency_ms,
                 backend_response.cost_usd,
             )
+        except ContextLengthExceededException as e:
+            observe_request("unknown", "error", 0.0, 0.0)
+            raise HTTPException(status_code=400, detail=str(e))
         except NoAvailableBackendException as e:
             observe_request("unknown", "error", 0.0, 0.0)
             raise HTTPException(status_code=503, detail=str(e))

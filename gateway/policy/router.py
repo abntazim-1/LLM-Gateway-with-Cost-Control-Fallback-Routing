@@ -2,7 +2,7 @@ import asyncio
 import logging
 import re
 import time
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 from gateway.adapters.base import BaseAdapter, NormalizedResponse
 from gateway.policy.circuit_breaker import CircuitBreakerRegistry
@@ -48,6 +48,15 @@ MIN_ADEQUATE_RESPONSE_CHARS = 20
 
 
 class NoAvailableBackendException(Exception):
+    pass
+
+
+class ContextLengthExceededException(Exception):
+    """No healthy backend has a context window large enough for this request.
+
+    Distinct from NoAvailableBackendException because it is a client error —
+    retrying or failing over cannot help, the input simply does not fit."""
+
     pass
 
 
@@ -165,6 +174,40 @@ class Router:
             ]
             if capable_candidates:
                 candidates = capable_candidates
+
+        # Context-window filtering. Unlike the filters above this is a HARD
+        # constraint with no fallback: routing to a backend whose window
+        # cannot fit the request guarantees an upstream failure, so keeping
+        # such a candidate would only burn the retry/failover budget on a
+        # request no backend can serve. Backends that declare no
+        # context_length are treated as unconstrained rather than excluded.
+        requested_max_tokens = kwargs.get("max_tokens") or 0
+        if messages:
+            fitting: List[BaseAdapter] = []
+            # Report the closest miss, since token counts are per-tokenizer
+            # and so differ between backends.
+            best_shortfall: Optional[Tuple[int, int, int]] = None
+            for adapter in candidates:
+                if not adapter.context_length:
+                    fitting.append(adapter)
+                    continue
+                needed = adapter.count_prompt_tokens(messages) + requested_max_tokens
+                if needed <= adapter.context_length:
+                    fitting.append(adapter)
+                    continue
+                shortfall = needed - adapter.context_length
+                if best_shortfall is None or shortfall < best_shortfall[0]:
+                    best_shortfall = (shortfall, needed, adapter.context_length)
+
+            if not fitting:
+                shortfall, needed, window = best_shortfall  # type: ignore[misc]
+                raise ContextLengthExceededException(
+                    f"Request needs ~{needed} tokens (prompt + "
+                    f"max_tokens={requested_max_tokens}) but the largest "
+                    f"available backend window is {window} — over by "
+                    f"{shortfall}."
+                )
+            candidates = fitting
 
         # Honor an explicitly requested model when a healthy backend serves
         # it, same filter-then-fallback shape as the capability check above:

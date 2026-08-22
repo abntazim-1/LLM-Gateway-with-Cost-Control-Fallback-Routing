@@ -117,6 +117,56 @@ def test_stream_is_not_billed_at_the_max_tokens_ceiling(client_and_key):
     )
 
 
+class UsageReportingStreamAdapter(ShortStreamAdapter):
+    """Emits a final usage chunk, as OpenAI-compatible backends do when asked
+    via stream_options.include_usage. The numbers are deliberately unlike any
+    local estimate so the test can tell which source was used."""
+
+    REPORTED_PROMPT = 777
+    REPORTED_COMPLETION = 333
+
+    async def complete_stream(
+        self, messages: List[Dict[str, str]], **kwargs
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        async for chunk in super().complete_stream(messages, **kwargs):
+            yield chunk
+        yield {
+            "id": "chatcmpl-test",
+            "model": self.model,
+            "choices": [],
+            "usage": {
+                "prompt_tokens": self.REPORTED_PROMPT,
+                "completion_tokens": self.REPORTED_COMPLETION,
+                "total_tokens": self.REPORTED_PROMPT + self.REPORTED_COMPLETION,
+            },
+        }
+
+
+def test_provider_reported_usage_is_preferred_over_local_estimate(client_and_key):
+    """Ground truth from the provider must win over the gateway's estimate."""
+    client, api_key = client_and_key
+    main.get_state().router.adapters = [
+        UsageReportingStreamAdapter(
+            {
+                "id": "test-stream-backend",
+                "provider": "ollama",
+                "model": "test-model",
+                "cost_per_1k_prompt": 1.0,
+                "cost_per_1k_completion": 1.0,
+            }
+        )
+    ]
+    _stream_once(client, api_key, content="usage passthrough check")
+
+    billed = _billed_cost(client, api_key)
+    expected = (
+        UsageReportingStreamAdapter.REPORTED_PROMPT
+        + UsageReportingStreamAdapter.REPORTED_COMPLETION
+    ) / 1000.0
+
+    assert billed == pytest.approx(expected, rel=0.01)
+
+
 def test_stream_cost_reflects_generated_tokens(client_and_key):
     client, api_key = client_and_key
     _stream_once(client, api_key)

@@ -101,6 +101,7 @@ class AnthropicAdapter(BaseAdapter):
 
         try:
             msg_id = "anthropic-" + os.urandom(8).hex()
+            stream_usage: Dict[str, int] = {}
             async with self.client.stream(
                 "POST",
                 f"{self.endpoint}/messages",
@@ -129,6 +130,21 @@ class AnthropicAdapter(BaseAdapter):
                             if event_type == "message_start":
                                 if "message" in event_data:
                                     msg_id = event_data["message"].get("id", msg_id)
+                                    # Anthropic reports input tokens up front
+                                    # and output tokens on message_delta; both
+                                    # are normalized onto the final chunk as an
+                                    # OpenAI-shaped `usage` so callers have one
+                                    # contract regardless of provider.
+                                    stream_usage["prompt_tokens"] = (
+                                        event_data["message"]
+                                        .get("usage", {})
+                                        .get("input_tokens", 0)
+                                    )
+
+                            elif event_type == "message_delta":
+                                stream_usage["completion_tokens"] = event_data.get(
+                                    "usage", {}
+                                ).get("output_tokens", 0)
 
                             elif event_type == "content_block_delta":
                                 delta = event_data.get("delta", {})
@@ -151,7 +167,7 @@ class AnthropicAdapter(BaseAdapter):
                                     }
 
                             elif event_type == "message_stop":
-                                yield {
+                                final_chunk = {
                                     "id": msg_id,
                                     "object": "chat.completion.chunk",
                                     "created": int(time.time()),
@@ -164,6 +180,17 @@ class AnthropicAdapter(BaseAdapter):
                                         }
                                     ],
                                 }
+                                if stream_usage:
+                                    prompt = stream_usage.get("prompt_tokens", 0)
+                                    completion = stream_usage.get(
+                                        "completion_tokens", 0
+                                    )
+                                    final_chunk["usage"] = {
+                                        "prompt_tokens": prompt,
+                                        "completion_tokens": completion,
+                                        "total_tokens": prompt + completion,
+                                    }
+                                yield final_chunk
                                 break
                         except Exception:
                             continue
