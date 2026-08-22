@@ -141,13 +141,19 @@ class Router:
         strategy: str = "cost_first",
         timeout_sec: float = 30.0,
         min_tokens_for_complex: int = 500,
+        latency_recheck_sec: float = 300.0,
     ):
         self.adapters = adapters
         self.circuit_registry = circuit_registry
         self.strategy = strategy
         self.timeout_sec = timeout_sec
         self.min_tokens_for_complex = min_tokens_for_complex
+        # How long a latency measurement stays trusted before the backend is
+        # re-probed under latency_first. Without this a single slow sample
+        # sidelines a backend permanently.
+        self.latency_recheck_sec = latency_recheck_sec
         self.latency_ema: Dict[str, float] = {}
+        self._latency_measured_at: Dict[str, float] = {}
         self._rr_counter = 0
 
     async def close(self) -> None:
@@ -355,8 +361,7 @@ class Router:
             # next candidate in execute() always moves *up* in capability.
             candidates.sort(key=self._cascade_key)
         elif self.strategy == "latency_first":
-            # Rank by EMA latency, defaults to a high value if unknown
-            candidates.sort(key=lambda a: self.latency_ema.get(a.id, 9999.0))
+            candidates.sort(key=self._fastest_first_key)
         elif self.strategy == "round_robin" or self.strategy == "weighted_round_robin":
             if len(candidates) > 1:
                 idx = self._rr_counter % len(candidates)
@@ -380,6 +385,31 @@ class Router:
 
     def _any_tier_declared(self) -> bool:
         return any(a.capability_tier for a in self.adapters)
+
+    def _fastest_first_key(self, adapter: BaseAdapter) -> Tuple[float, float]:
+        """Fastest measured first, with unmeasured backends tried first.
+
+        Defaulting an unknown backend to a large latency ranked it last
+        forever: never selected, so never measured, so never selected — a
+        newly added fast backend could be starved indefinitely. Optimism in
+        the face of uncertainty costs at most one probe request, after which
+        the backend has a real measurement and competes on merit.
+
+        A measurement also goes stale: a backend that was slow once stays
+        ranked slow even after recovering. Past `latency_recheck_sec` it is
+        treated as unmeasured again so it gets re-probed.
+        """
+        measured_at = self._latency_measured_at.get(adapter.id)
+        if (
+            measured_at is None
+            or adapter.id not in self.latency_ema
+            or (time.time() - measured_at) > self.latency_recheck_sec
+        ):
+            return (
+                0.0,
+                adapter.cost_per_1k_prompt,
+            )  # sorts ahead of any real measurement
+        return (1.0, self.latency_ema[adapter.id])
 
     def _cheapest_first_key(self, adapter: BaseAdapter) -> Tuple[float, int]:
         """Cheapest first; prefer the more capable backend at equal price."""
@@ -438,6 +468,7 @@ class Router:
                     self.latency_ema[adapter.id] = (alpha * response.latency_ms) + (
                         (1 - alpha) * current_ema
                     )
+                    self._latency_measured_at[adapter.id] = time.time()
 
                     await breaker.record_success()
 

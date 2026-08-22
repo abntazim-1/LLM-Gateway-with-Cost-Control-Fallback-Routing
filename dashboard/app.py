@@ -77,7 +77,7 @@ with tab1:
         "This client sandbox utilizes unified SSE streaming from the LLM Gateway API."
     )
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         api_key = st.text_input(
             "Client API Key",
@@ -98,6 +98,18 @@ with tab1:
             step=32,
             help="Caps generation length so local/slow backends can't run "
             "past the client's own request timeout below.",
+        )
+    with col4:
+        history_limit = st.number_input(
+            "History Messages",
+            min_value=2,
+            max_value=100,
+            value=10,
+            step=2,
+            help="How many recent messages are sent upstream. The whole "
+            "conversation stays on screen — this only bounds what is "
+            "re-sent (and re-billed) each turn. Sending the full history "
+            "every turn makes a session's total cost grow quadratically.",
         )
 
     if "messages" not in st.session_state:
@@ -130,7 +142,11 @@ with tab1:
                     headers={"Authorization": f"Bearer {api_key}"},
                     json={
                         "model": model_name,
-                        "messages": st.session_state.messages,
+                        # Only the recent window is re-sent. The full
+                        # conversation is still rendered above; sending all of
+                        # it every turn re-bills every prior message, so total
+                        # session cost grows with the square of its length.
+                        "messages": st.session_state.messages[-history_limit:],
                         "stream": True,
                         "max_tokens": max_tokens,
                     },
@@ -139,6 +155,8 @@ with tab1:
                     if r.status_code != 200:
                         st.error(f"Error {r.status_code}: {r.read().decode('utf-8')}")
                     else:
+                        # Needed to attach a quality rating to this exchange.
+                        st.session_state.last_request_id = r.headers.get("X-Request-ID")
                         for line in r.iter_lines():
                             line = line.strip()
                             if not line:
@@ -165,6 +183,50 @@ with tab1:
                         )
             except Exception as e:
                 st.error(f"Connection failed: {e}")
+
+    # Quality rating for the last exchange. Nothing else in the gateway
+    # records whether the model that answered answered *well*, which is what
+    # makes every routing decision unfalsifiable and leaves a learned router
+    # with no training signal. This is the smallest thing that starts
+    # accumulating that label.
+    if (
+        st.session_state.messages
+        and st.session_state.messages[-1]["role"] == "assistant"
+        and st.session_state.get("last_request_id")
+    ):
+        request_id = st.session_state.last_request_id
+        rated = st.session_state.get("rated_requests", set())
+
+        if request_id in rated:
+            st.caption("✓ Thanks — rating recorded.")
+        else:
+            fb_col1, fb_col2, _ = st.columns([1, 1, 8])
+
+            def _send_rating(rating: int):
+                try:
+                    resp = httpx.post(
+                        f"{gateway_url}/v1/feedback",
+                        headers={"Authorization": f"Bearer {api_key}"},
+                        json={"request_id": request_id, "rating": rating},
+                        timeout=5.0,
+                    )
+                    if resp.status_code == 200:
+                        st.session_state.setdefault("rated_requests", set()).add(
+                            request_id
+                        )
+                    else:
+                        st.warning(f"Could not record rating: {resp.text}")
+                except Exception as exc:
+                    st.warning(f"Could not record rating: {exc}")
+
+            with fb_col1:
+                if st.button("👍", key=f"up-{request_id}", help="Good answer"):
+                    _send_rating(1)
+                    st.rerun()
+            with fb_col2:
+                if st.button("👎", key=f"down-{request_id}", help="Poor answer"):
+                    _send_rating(-1)
+                    st.rerun()
 
     # Capturing a new prompt and rerunning immediately — with nothing else in
     # between — is the safe pattern here. Doing any network/streaming work
@@ -246,6 +308,32 @@ with tab2:
                 st.dataframe(ledger_view, use_container_width=True, hide_index=True)
             else:
                 st.info("No requests recorded yet.")
+
+            # Answer-quality signal per backend. Cost and latency alone can't
+            # tell you whether cheaper routing is actually working — a change
+            # that sends everything to a weaker model shows up here as a
+            # cost *improvement* and nothing else.
+            st.subheader("Answer Quality by Backend")
+            try:
+                fb_resp = httpx.get(
+                    f"{gateway_url}/admin/feedback", headers=headers, timeout=5.0
+                )
+                fb_rows = fb_resp.json() if fb_resp.status_code == 200 else []
+            except Exception:
+                fb_rows = []
+
+            if fb_rows:
+                fb_df = pd.DataFrame(fb_rows)
+                fb_df["approval_%"] = (fb_df["positive"] / fb_df["total"] * 100).round(
+                    1
+                )
+                st.dataframe(fb_df, use_container_width=True, hide_index=True)
+            else:
+                st.info(
+                    "No ratings yet — use 👍/👎 in the Chat Sandbox. Until "
+                    "ratings accumulate, routing changes can only be judged "
+                    "on cost and latency, not on answer quality."
+                )
 
             # Spend charts
             if total_reqs > 0:
