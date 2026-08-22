@@ -22,8 +22,10 @@ def test_guardrails_prompt_injection_detection():
     with pytest.raises(GuardrailViolationException) as exc_info:
         pipeline.validate_messages(messages)
 
+    # Asserts on behaviour, not on the regex source text — the previous
+    # `"ignore" in message` check broke as soon as the pattern was widened to
+    # `ignor\w*` to also catch "ignoring"/"ignores".
     assert "Prompt Guardrail Violation" in str(exc_info.value)
-    assert "ignore" in str(exc_info.value).lower()
 
 
 def test_guardrails_override_system_prompt_detection():

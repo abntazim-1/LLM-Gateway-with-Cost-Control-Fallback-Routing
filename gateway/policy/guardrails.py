@@ -1,6 +1,8 @@
 import re
 from typing import Dict, List, Optional
 
+from gateway.policy.normalize import matching_variants
+
 
 class GuardrailViolationException(Exception):
     """Exception raised when a request violates prompt safety or content guardrails."""
@@ -8,21 +10,86 @@ class GuardrailViolationException(Exception):
     pass
 
 
+# Verbs used to tell a model to abandon its instructions, and the things it
+# gets told to abandon. Kept as separate alternation groups and combined so
+# that adding a synonym to either side covers every phrasing on the other —
+# enumerating whole sentences instead is what let "disregard all previous
+# instructions" through while "ignore" was blocked.
+_DISCARD_VERBS = (
+    r"ignor\w*|disregard\w*|forget|overrid\w*|bypass\w*|discard\w*|"
+    r"skip|drop|delete|erase|abandon|set\s+aside|pay\s+no\s+attention\s+to"
+)
+_INSTRUCTION_NOUNS = (
+    r"instruction|directive|prompt|rule|guideline|command|order|constraint|"
+    r"restriction|guardrail|polic\w+|training|programming"
+)
+_PRIOR_QUALIFIERS = (
+    r"previous|prior|above|earlier|preceding|foregoing|initial|original|"
+    r"system|all|any|your|the"
+)
+
+
 class GuardrailsPipeline:
     """
     Content safety and security guardrails pipeline.
     Inspects prompts for prompt injection / jailbreak patterns before sending requests to LLMs.
+
+    Input screening normalizes text first (see `normalize_for_matching`) so
+    zero-width characters, homoglyphs, and leetspeak cannot slip a known
+    pattern through. Pattern matching still only covers English phrasings it
+    has seen — a paraphrase in another language reads as different text — so
+    an optional semantic classifier can be layered on top; see
+    `gateway.policy.classifier`.
     """
 
     def __init__(self):
         self.prompt_injection_patterns = [
+            # "ignore/disregard/forget [all] [previous] instructions"
             re.compile(
-                r"ignore\s+(all\s+)?(previous|prior)\s+instructions", re.IGNORECASE
+                rf"\b({_DISCARD_VERBS})\b[^.!?\n]{{0,40}}?"
+                rf"\b({_PRIOR_QUALIFIERS})\b[^.!?\n]{{0,20}}?"
+                rf"\b({_INSTRUCTION_NOUNS})s?\b",
+                re.IGNORECASE,
             ),
-            re.compile(r"override\s+(the\s+)?system\s+prompt", re.IGNORECASE),
-            re.compile(r"you\s+are\s+now\s+in\s+developer\s+mode", re.IGNORECASE),
-            re.compile(r"jailbreak\s+mode", re.IGNORECASE),
-            re.compile(r"act\s+as\s+DAN", re.IGNORECASE),
+            # Same idea without a qualifier: "ignore your programming",
+            # "forget everything you were told".
+            re.compile(
+                rf"\b({_DISCARD_VERBS})\b[^.!?\n]{{0,30}}?"
+                rf"\b(everything|anything|all)\b[^.!?\n]{{0,30}}?"
+                r"\b(you\s+were\s+(told|instructed|given)|before|prior|earlier)\b",
+                re.IGNORECASE,
+            ),
+            # Role/mode hijacking.
+            re.compile(
+                r"\byou\s+are\s+now\s+(in\s+)?(developer|debug|god|admin|"
+                r"unrestricted|unfiltered|dan)\s*(mode)?\b",
+                re.IGNORECASE,
+            ),
+            re.compile(r"\bjailbreak\s*(mode)?\b", re.IGNORECASE),
+            re.compile(r"\bact\s+as\s+(dan|an?\s+unrestricted)\b", re.IGNORECASE),
+            re.compile(
+                r"\b(enable|activate|enter|switch\s+to)\s+"
+                r"(developer|debug|god|dan|unrestricted|unfiltered)\s*mode\b",
+                re.IGNORECASE,
+            ),
+            # System-prompt extraction: asking the model to disclose or repeat
+            # its instructions.
+            re.compile(
+                rf"\b(reveal|show|print|output|repeat|display|tell\s+me|"
+                rf"what\s+(is|are|were))\b[^.!?\n]{{0,40}}?"
+                rf"\b(your|the)\b[^.!?\n]{{0,20}}?"
+                rf"\b(system\s+prompt|{_INSTRUCTION_NOUNS}s?|hidden\s+\w+)\b",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                r"\brepeat\s+(the\s+)?(text|words|everything)\s+above\b",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                r"\bwhat\s+(were|was)\s+you\s+(told|instructed|programmed)\b"
+                r"[^.!?\n]{0,30}\bnot\s+to\b",
+                re.IGNORECASE,
+            ),
         ]
         # Secrets a model must never echo back to the client. These are
         # redacted from the completion rather than blocking the response.
@@ -56,14 +123,18 @@ class GuardrailsPipeline:
         ]
 
     def validate_messages(self, messages: List[Dict[str, str]]) -> None:
-        """Validate input prompt messages against injection/jailbreak rules."""
+        """Validate input prompt messages against injection/jailbreak rules.
+
+        Matching runs against a normalized copy so obfuscated spellings cannot
+        evade a pattern; the caller's original text is untouched."""
         for msg in messages:
             content = msg.get("content", "")
             if not content:
                 continue
 
+            candidates = matching_variants(content)
             for pattern in self.prompt_injection_patterns:
-                if pattern.search(content):
+                if any(pattern.search(c) for c in candidates):
                     raise GuardrailViolationException(
                         f"Prompt Guardrail Violation: Potential prompt injection / jailbreak pattern detected: '{pattern.pattern}'"
                     )
