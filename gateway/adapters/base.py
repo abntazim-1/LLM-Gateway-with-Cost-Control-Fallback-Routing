@@ -35,6 +35,11 @@ class NormalizedResponse(BaseModel):
     completion_tokens: int
     cost_usd: float
     latency_ms: float
+    # True when the backend that answered was not the router's first choice —
+    # i.e. the caller received a different (possibly much weaker) model than
+    # routing selected. Set by the router, surfaced to clients as a response
+    # header so a silent substitution is at least observable.
+    is_fallback: bool = False
 
 
 class AdapterException(Exception):
@@ -54,6 +59,11 @@ class BaseAdapter(ABC):
         # 0 / absent means "unknown", which is treated as unconstrained rather
         # than as a zero-size window.
         self.context_length = config.get("context_length", 0) or 0
+        # Declared capability, independent of price. Higher is more capable.
+        # Price is a poor proxy — a small fast model can cost more than a
+        # large self-hosted one — so routing that wants "the better model"
+        # must rank on this, falling back to cost only when it is unset.
+        self.capability_tier = config.get("capability_tier", 0) or 0
         self.tokenizer_name = config.get("tokenizer", "cl100k_base")
         self.token_overhead_per_message = config.get(
             "token_overhead_per_message", DEFAULT_TOKEN_OVERHEAD_PER_MESSAGE

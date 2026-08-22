@@ -75,16 +75,49 @@ _COMPLEXITY_THRESHOLD = 3
 # so require genuine lexical variety before length earns a score.
 _MIN_DISTINCT_WORDS_FOR_LENGTH = 40
 
-# Surface-level signals that a completion didn't actually answer the
-# request: a refusal/hedge, or an answer too short to plausibly be one.
-# Deliberately not a "quality" judgment — just a cheap, explainable check
-# used to decide whether `cascade` routing escalates to a pricier backend.
-INADEQUATE_RESPONSE_PATTERNS = re.compile(
-    r"\b(i don'?t know|i'?m not sure|i cannot|i can'?t help|i'?m unable to|"
-    r"i'?m sorry|i apologize|as an ai|unclear|i don'?t have (enough|access))\b",
+# Refusals / non-answers. Anchored to the start of the response: these
+# phrases appear mid-answer in perfectly good replies ("I'm sorry to hear
+# that. Here is the fix: ...") and matching them anywhere escalated complete
+# answers to a pricier backend for the sake of a polite opener.
+REFUSAL_PATTERNS = re.compile(
+    r"^\W*("
+    r"i don'?t know|i do not know|i'?m not sure|i am not sure|"
+    r"i cannot|i can'?t|i'?m unable to|i am unable to|"
+    r"i don'?t have (enough|access)|as an ai|"
+    r"unfortunately[, ]|sorry[, ]|i apologi[sz]e"
+    # A handful of common non-English refusals. Not comprehensive — full
+    # multilingual coverage needs a classifier — but these are cheap and a
+    # model answering in the user's language is the common case.
+    r"|je ne sais pas|je ne peux pas|d[ée]sol[ée]"
+    r"|no s[ée]\b|no puedo|lo siento"
+    r"|ich wei[sß]+ nicht|ich kann nicht|es tut mir leid"
+    r"|n[ãa]o sei|n[ãa]o posso|desculpe"
+    r"|non lo so|non posso|mi dispiace"
+    r")",
     re.IGNORECASE,
 )
-MIN_ADEQUATE_RESPONSE_CHARS = 20
+# A refusal opener only means the answer failed if the response is *mostly*
+# that refusal. Beyond this length there is substantive content after it.
+MAX_REFUSAL_RESPONSE_CHARS = 120
+
+# Prompts that ask for something substantive, where a one-line reply is
+# probably a failure. Without this, a correct terse answer ("Paris") to a
+# terse question was escalated — the opposite of the cost goal.
+SUBSTANTIVE_REQUEST = re.compile(
+    r"\b(explain|describe|elaborate|walk\s+me\s+through|write|draft|compose|"
+    # "list" only as an imperative — "a list comprehension" is a noun phrase
+    # and asking for one warrants a one-line answer.
+    r"list\s+(the|all|out|every|some|each)|enumerate|"
+    r"compare|analyz|analys|summari[sz]e|outline|"
+    r"step[- ]by[- ]step|in\s+detail|why|how\s+(do|does|would|can|should))\b",
+    re.IGNORECASE,
+)
+# Only an empty reply is a non-answer regardless of what was asked. Any
+# higher blanket floor escalates correct terse answers ("Paris", "42"),
+# which is the opposite of what cascade is for.
+MIN_ADEQUATE_RESPONSE_CHARS = 1
+# Applied only when the prompt actually asked for something substantive.
+MIN_SUBSTANTIVE_RESPONSE_CHARS = 80
 
 
 class NoAvailableBackendException(Exception):
@@ -187,14 +220,49 @@ class Router:
         return self._complexity_score(messages) >= _COMPLEXITY_THRESHOLD
 
     @staticmethod
-    def _is_response_inadequate(response: NormalizedResponse) -> bool:
-        """Cheap, explainable check on what a backend actually answered —
-        used by `cascade` to decide whether to escalate, instead of guessing
-        from the prompt before generating anything."""
+    def _is_response_inadequate(
+        response: NormalizedResponse,
+        messages: Optional[List[Dict[str, str]]] = None,
+        finish_reason: Optional[str] = None,
+    ) -> bool:
+        """Whether a completion looks like it failed to answer the request.
+
+        Judged against the prompt, not in isolation: "Paris" is a complete
+        answer to a factual question and a failure in response to "explain
+        the water cycle in detail". Scoring length alone escalated correct
+        terse answers to a pricier backend, which inverts the cost goal.
+
+        This detects *non-answers*, not wrong ones. A fluent, confident,
+        entirely incorrect answer passes — see F9 in docs/AI_ML_FLAWS.md.
+        """
         text = " ".join(m.content for m in response.messages).strip()
+
+        if not text:
+            return True
+
+        # Hard evidence the backend stopped early rather than finished.
+        if finish_reason == "length":
+            return True
+
+        # A refusal only counts when it is essentially the whole reply.
+        if len(text) <= MAX_REFUSAL_RESPONSE_CHARS and REFUSAL_PATTERNS.search(text):
+            return True
+
         if len(text) < MIN_ADEQUATE_RESPONSE_CHARS:
             return True
-        return bool(INADEQUATE_RESPONSE_PATTERNS.search(text))
+
+        # Terse replies are only suspect when the prompt asked for substance.
+        prompt = " ".join(
+            m.get("content", "") for m in (messages or []) if m.get("content")
+        )
+        if (
+            prompt
+            and SUBSTANTIVE_REQUEST.search(prompt)
+            and len(text) < MIN_SUBSTANTIVE_RESPONSE_CHARS
+        ):
+            return True
+
+        return False
 
     async def get_ranked_adapters(
         self, messages: Optional[List[Dict[str, str]]] = None, **kwargs
@@ -280,12 +348,12 @@ class Router:
                 candidates = model_candidates
 
         # Rank candidates
-        if self.strategy == "cost_first" or self.strategy == "cascade":
-            # cascade starts from the same cheapest-first order as cost_first;
-            # execute() is what actually escalates it up the list on a bad
-            # answer instead of just failing over on hard errors like the
-            # other strategies do.
-            candidates.sort(key=lambda a: a.cost_per_1k_prompt)
+        if self.strategy == "cost_first":
+            candidates.sort(key=self._cheapest_first_key)
+        elif self.strategy == "cascade":
+            # Ordered weakest-and-cheapest first so that escalating to the
+            # next candidate in execute() always moves *up* in capability.
+            candidates.sort(key=self._cascade_key)
         elif self.strategy == "latency_first":
             # Rank by EMA latency, defaults to a high value if unknown
             candidates.sort(key=lambda a: self.latency_ema.get(a.id, 9999.0))
@@ -295,15 +363,47 @@ class Router:
                 self._rr_counter += 1
                 candidates = candidates[idx:] + candidates[:idx]
         elif self.strategy == "complexity":
-            is_complex = self._is_complex_request(messages)
-            if is_complex:
-                # Rank premium models first (higher cost first)
-                candidates.sort(key=lambda a: a.cost_per_1k_prompt, reverse=True)
+            if self._is_complex_request(messages):
+                candidates.sort(key=self._most_capable_first_key)
             else:
-                # Rank budget models first (cheaper cost first)
-                candidates.sort(key=lambda a: a.cost_per_1k_prompt)
+                candidates.sort(key=self._cheapest_first_key)
 
         return candidates
+
+    # ── Ranking keys ─────────────────────────────────────────────────────────
+    # Capability and price are separate axes. Ranking "the better model" by
+    # price assumes they correlate, and they often don't: a small fast model
+    # can be priced above a large self-hosted one, in which case escalating by
+    # cost escalates to the *weaker* backend. Backends therefore declare
+    # `capability_tier`, and cost is used only to break ties or when no
+    # backend declares a tier.
+
+    def _any_tier_declared(self) -> bool:
+        return any(a.capability_tier for a in self.adapters)
+
+    def _cheapest_first_key(self, adapter: BaseAdapter) -> Tuple[float, int]:
+        """Cheapest first; prefer the more capable backend at equal price."""
+        return (adapter.cost_per_1k_prompt, -adapter.capability_tier)
+
+    def _cascade_key(self, adapter: BaseAdapter) -> Tuple[float, float]:
+        """Weakest-and-cheapest first, so escalation moves up in capability.
+
+        Falls back to pure cost ordering when no tier is declared, matching
+        the previous behaviour.
+        """
+        if not self._any_tier_declared():
+            return (adapter.cost_per_1k_prompt, 0.0)
+        return (float(adapter.capability_tier), adapter.cost_per_1k_prompt)
+
+    def _most_capable_first_key(self, adapter: BaseAdapter) -> Tuple[float, float]:
+        """Most capable first; cheapest wins within a tier.
+
+        With no tiers declared anywhere this degrades to the previous
+        cost-descending behaviour, so existing configs are unaffected.
+        """
+        if not self._any_tier_declared():
+            return (-adapter.cost_per_1k_prompt, 0.0)
+        return (-float(adapter.capability_tier), adapter.cost_per_1k_prompt)
 
     async def execute(self, messages: List[Dict[str, str]], **kwargs):
         ranked = await self.get_ranked_adapters(messages=messages, **kwargs)
@@ -344,7 +444,7 @@ class Router:
                     if (
                         self.strategy == "cascade"
                         and rank_idx < len(ranked) - 1
-                        and self._is_response_inadequate(response)
+                        and self._is_response_inadequate(response, messages)
                     ):
                         logger.info(
                             f"Cascade: {adapter.id}'s response looked inadequate "
@@ -354,12 +454,18 @@ class Router:
                         cascade_discarded_cost += response.cost_usd
                         break  # move to the next, pricier adapter
 
+                    updates: Dict[str, Any] = {}
                     if cascade_discarded_cost:
-                        response = response.model_copy(
-                            update={
-                                "cost_usd": response.cost_usd + cascade_discarded_cost
-                            }
-                        )
+                        updates["cost_usd"] = response.cost_usd + cascade_discarded_cost
+                    if rank_idx > 0:
+                        # Answered by something other than the router's first
+                        # choice. Availability-wise that is the whole point of
+                        # failover, but the caller may have received a much
+                        # weaker model than was selected, so mark it rather
+                        # than let the substitution pass silently.
+                        updates["is_fallback"] = True
+                    if updates:
+                        response = response.model_copy(update=updates)
                     return response
                 except asyncio.TimeoutError:
                     last_error = asyncio.TimeoutError(

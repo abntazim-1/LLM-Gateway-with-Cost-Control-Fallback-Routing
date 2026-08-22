@@ -108,12 +108,33 @@ async def test_cascade_bills_only_one_attempt_when_no_escalation():
 
 
 @pytest.mark.asyncio
-async def test_cascade_escalates_on_too_short_response():
-    router, cheap, premium = _make_router(cheap_reply="ok")
+async def test_cascade_escalates_on_short_reply_to_substantive_request():
+    """Brevity is judged against what was asked, not in isolation.
 
-    response = await router.execute(messages=[{"role": "user", "content": "hi"}])
+    This previously asserted that any reply under 20 characters escalated,
+    which meant a correct terse answer ("Paris", "42") was sent to a pricier
+    backend — the opposite of the cost goal. Escalation now requires the
+    prompt to have actually asked for something substantive.
+    """
+    router, cheap, premium = _make_router(cheap_reply="It rains.")
+
+    response = await router.execute(
+        messages=[{"role": "user", "content": "Explain the water cycle in detail"}]
+    )
 
     assert response.backend_id == "premium"
+
+
+@pytest.mark.asyncio
+async def test_cascade_keeps_correct_terse_answer_to_terse_question():
+    router, cheap, premium = _make_router(cheap_reply="Paris")
+
+    response = await router.execute(
+        messages=[{"role": "user", "content": "What is the capital of France?"}]
+    )
+
+    assert response.backend_id == "cheap"
+    assert premium.call_count == 0
 
 
 @pytest.mark.asyncio

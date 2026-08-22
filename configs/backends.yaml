@@ -12,6 +12,10 @@ backends:
     cost_per_1k_completion: 0.0002
     tokenizer: cl100k_base
     token_overhead_per_message: 7
+    # 3.8B parameters — the more capable of the two local models, despite
+    # being priced lower. Routing that wants "the better model" ranks on this
+    # rather than on price, which would pick the weaker one here.
+    capability_tier: 2
     capabilities:
       - json_mode
     context_length: 8192
@@ -26,6 +30,8 @@ backends:
     # Qwen's template ships a default system block, so its fixed overhead is
     # far larger than the OpenAI-style default of 4.
     token_overhead_per_message: 26
+    # 0.5B parameters — the weaker model, even though it is priced higher.
+    capability_tier: 1
     capabilities:
       - json_mode
     context_length: 8192
