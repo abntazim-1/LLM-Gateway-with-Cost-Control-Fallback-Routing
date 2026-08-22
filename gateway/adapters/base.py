@@ -1,11 +1,14 @@
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, AsyncGenerator
+from typing import Any, AsyncGenerator, Dict, List, Optional
+
 from pydantic import BaseModel
+
 
 class NormalizedMessage(BaseModel):
     role: str
     content: str
+
 
 class NormalizedResponse(BaseModel):
     id: str
@@ -17,9 +20,12 @@ class NormalizedResponse(BaseModel):
     cost_usd: float
     latency_ms: float
 
+
 class AdapterException(Exception):
     """Base exception for all adapter errors."""
+
     pass
+
 
 class BaseAdapter(ABC):
     def __init__(self, config: Dict[str, Any]):
@@ -30,8 +36,11 @@ class BaseAdapter(ABC):
         self.cost_per_1k_prompt = config.get("cost_per_1k_prompt", 0.0)
         self.cost_per_1k_completion = config.get("cost_per_1k_completion", 0.0)
         import httpx
-        self.client = httpx.AsyncClient(limits=httpx.Limits(max_keepalive_connections=20))
-        
+
+        self.client = httpx.AsyncClient(
+            limits=httpx.Limits(max_keepalive_connections=20)
+        )
+
     async def close(self) -> None:
         """Close underlying httpx.AsyncClient session and release connection pool / file descriptors."""
         if hasattr(self, "client") and self.client is not None:
@@ -50,16 +59,27 @@ class BaseAdapter(ABC):
 
     def _filter_kwargs(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
         """Filter out dangerous or unsupported kwargs to prevent injection."""
-        allowed_keys = {"temperature", "max_tokens", "top_p", "stop", "presence_penalty", "frequency_penalty"}
+        allowed_keys = {
+            "temperature",
+            "max_tokens",
+            "top_p",
+            "stop",
+            "presence_penalty",
+            "frequency_penalty",
+        }
         return {k: v for k, v in kwargs.items() if k in allowed_keys}
 
     @abstractmethod
-    async def complete(self, messages: List[Dict[str, str]], **kwargs) -> NormalizedResponse:
+    async def complete(
+        self, messages: List[Dict[str, str]], **kwargs
+    ) -> NormalizedResponse:
         """Execute a completion request."""
         pass
 
     @abstractmethod
-    async def complete_stream(self, messages: List[Dict[str, str]], **kwargs) -> AsyncGenerator[Dict[str, Any], None]:
+    async def complete_stream(
+        self, messages: List[Dict[str, str]], **kwargs
+    ) -> AsyncGenerator[Dict[str, Any], None]:
         """Execute a streaming completion request."""
         pass
 

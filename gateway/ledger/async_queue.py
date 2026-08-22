@@ -1,9 +1,11 @@
 import asyncio
 import logging
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional
+
 from gateway.ledger.base_store import BaseLedgerStore
 
 logger = logging.getLogger(__name__)
+
 
 class AsyncLedgerQueue:
     """
@@ -37,16 +39,16 @@ class AsyncLedgerQueue:
             self._worker_task = None
 
     async def record_request(
-        self, 
-        api_key: str, 
-        req_id: str, 
-        backend: str, 
-        model: str, 
-        prompt_tokens: int, 
-        comp_tokens: int, 
-        cost: float, 
+        self,
+        api_key: str,
+        req_id: str,
+        backend: str,
+        model: str,
+        prompt_tokens: int,
+        comp_tokens: int,
+        cost: float,
         latency: float,
-        reserved_cost: float = 0.0
+        reserved_cost: float = 0.0,
     ):
         """Enqueue request payload for background processing without blocking."""
         item = {
@@ -58,7 +60,7 @@ class AsyncLedgerQueue:
             "comp_tokens": comp_tokens,
             "cost": cost,
             "latency": latency,
-            "reserved_cost": reserved_cost
+            "reserved_cost": reserved_cost,
         }
         try:
             self.queue.put_nowait(item)
@@ -85,7 +87,7 @@ class AsyncLedgerQueue:
                         comp_tokens=item["comp_tokens"],
                         cost=item["cost"],
                         latency=item["latency"],
-                        reserved_cost=item.get("reserved_cost", 0.0)
+                        reserved_cost=item.get("reserved_cost", 0.0),
                     )
                 except Exception as e:
                     logger.error(f"Error persisting ledger queue item: {e}")

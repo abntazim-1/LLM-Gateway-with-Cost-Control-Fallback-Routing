@@ -9,7 +9,9 @@ class BudgetPolicy:
     def __init__(self, ledger: LedgerStore):
         self.ledger = ledger
 
-    async def check_and_reserve(self, api_key: str, estimated_cost: float = 0.0) -> bool:
+    async def check_and_reserve(
+        self, api_key: str, estimated_cost: float = 0.0
+    ) -> bool:
         """
         Atomically verify budget limits and reserve *estimated_cost* against
         both daily and monthly spend counters.
@@ -28,4 +30,3 @@ class BudgetPolicy:
     async def check_preflight(self, api_key: str, estimated_cost: float = 0.0) -> bool:
         """Deprecated: use check_and_reserve instead (same semantics, atomic)."""
         return await self.check_and_reserve(api_key, estimated_cost)
-

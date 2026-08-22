@@ -1,10 +1,12 @@
-import sqlite3
 import asyncio
-import threading
-from typing import Dict, Any, Optional
 import os
+import sqlite3
+import threading
 from datetime import datetime, timezone
+from typing import Any, Dict, Optional
+
 from gateway.ledger.base_store import BaseLedgerStore
+
 
 class LedgerStore(BaseLedgerStore):
     """A thread-safe SQLite store for budgets and costs with thread-isolated connections."""
@@ -14,16 +16,14 @@ class LedgerStore(BaseLedgerStore):
         self.timeout = timeout
         self._local = threading.local()
         self._write_lock = threading.RLock()
-        self._is_memory = (db_path == ":memory:" or "mode=memory" in db_path)
+        self._is_memory = db_path == ":memory:" or "mode=memory" in db_path
         self._memory_conn: Optional[sqlite3.Connection] = None
         self._all_conns: list = []
-        
+
         if self._is_memory:
             # For in-memory DB (used in tests), maintain a shared connection handle
             self._memory_conn = sqlite3.connect(
-                self.db_path,
-                timeout=self.timeout,
-                check_same_thread=False
+                self.db_path, timeout=self.timeout, check_same_thread=False
             )
             self._memory_conn.row_factory = sqlite3.Row
             self._all_conns.append(self._memory_conn)
@@ -38,11 +38,11 @@ class LedgerStore(BaseLedgerStore):
         conn = getattr(self._local, "conn", None)
         if conn is None:
             conn = sqlite3.connect(
-                self.db_path,
-                timeout=self.timeout,
-                check_same_thread=False
+                self.db_path, timeout=self.timeout, check_same_thread=False
             )
-            conn.isolation_level = None  # Autocommit mode: prevent dangling transaction locks
+            conn.isolation_level = (
+                None  # Autocommit mode: prevent dangling transaction locks
+            )
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA busy_timeout=30000").fetchall()
             self._local.conn = conn
@@ -69,18 +69,20 @@ class LedgerStore(BaseLedgerStore):
                     requests_per_minute INTEGER DEFAULT 60
                 )
             """)
-            
+
             # safely migrate existing DB
             try:
                 conn.execute("ALTER TABLE budgets ADD COLUMN last_reset_date TEXT")
                 conn.execute("ALTER TABLE budgets ADD COLUMN last_reset_month TEXT")
             except sqlite3.OperationalError:
-                pass # columns already exist
+                pass  # columns already exist
             try:
-                conn.execute("ALTER TABLE budgets ADD COLUMN requests_per_minute INTEGER DEFAULT 60")
+                conn.execute(
+                    "ALTER TABLE budgets ADD COLUMN requests_per_minute INTEGER DEFAULT 60"
+                )
             except sqlite3.OperationalError:
                 pass
-                
+
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS requests (
                     id TEXT PRIMARY KEY,
@@ -124,20 +126,30 @@ class LedgerStore(BaseLedgerStore):
 
     def _load_budgets_from_config_sync(self, budgets_config: list):
         now_utc = datetime.now(timezone.utc)
-        today_str = now_utc.strftime('%Y-%m-%d')
-        month_str = now_utc.strftime('%Y-%m')
+        today_str = now_utc.strftime("%Y-%m-%d")
+        month_str = now_utc.strftime("%Y-%m")
         with self._write_lock:
             conn = self._get_connection()
             for b in budgets_config:
                 rpm = b.get("requests_per_minute", 60)
-                conn.execute("""
+                conn.execute(
+                    """
                     INSERT INTO budgets (api_key, daily_limit_usd, monthly_limit_usd, requests_per_minute, last_reset_date, last_reset_month)
                     VALUES (?, ?, ?, ?, ?, ?)
                     ON CONFLICT(api_key) DO UPDATE SET
                     daily_limit_usd=excluded.daily_limit_usd,
                     monthly_limit_usd=excluded.monthly_limit_usd,
                     requests_per_minute=excluded.requests_per_minute
-                """, (b["api_key"], b["daily_limit_usd"], b["monthly_limit_usd"], rpm, today_str, month_str))
+                """,
+                    (
+                        b["api_key"],
+                        b["daily_limit_usd"],
+                        b["monthly_limit_usd"],
+                        rpm,
+                        today_str,
+                        month_str,
+                    ),
+                )
             conn.commit()
 
     async def get_budget(self, api_key: str) -> Optional[Dict[str, Any]]:
@@ -145,100 +157,172 @@ class LedgerStore(BaseLedgerStore):
 
     def _get_budget_sync(self, api_key: str) -> Optional[Dict[str, Any]]:
         now_utc = datetime.now(timezone.utc)
-        today_str = now_utc.strftime('%Y-%m-%d')
-        month_str = now_utc.strftime('%Y-%m')
+        today_str = now_utc.strftime("%Y-%m-%d")
+        month_str = now_utc.strftime("%Y-%m")
 
         conn = self._get_connection()
-        row = conn.execute("SELECT * FROM budgets WHERE api_key = ?", (api_key,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM budgets WHERE api_key = ?", (api_key,)
+        ).fetchone()
         if not row:
             return None
-            
+
         budget = dict(row)
-        
-        needs_daily_reset = budget.get('last_reset_date') != today_str
-        needs_monthly_reset = budget.get('last_reset_month') != month_str
-        
+
+        needs_daily_reset = budget.get("last_reset_date") != today_str
+        needs_monthly_reset = budget.get("last_reset_month") != month_str
+
         if needs_daily_reset or needs_monthly_reset:
             with self._write_lock:
                 w_conn = self._get_connection()
-                w_row = w_conn.execute("SELECT * FROM budgets WHERE api_key = ?", (api_key,)).fetchone()
+                w_row = w_conn.execute(
+                    "SELECT * FROM budgets WHERE api_key = ?", (api_key,)
+                ).fetchone()
                 if w_row:
                     budget = dict(w_row)
-                    if budget.get('last_reset_date') != today_str:
-                        budget['spend_today'] = 0.0
-                        budget['last_reset_date'] = today_str
-                    if budget.get('last_reset_month') != month_str:
-                        budget['spend_month'] = 0.0
-                        budget['last_reset_month'] = month_str
-                    w_conn.execute("""
+                    if budget.get("last_reset_date") != today_str:
+                        budget["spend_today"] = 0.0
+                        budget["last_reset_date"] = today_str
+                    if budget.get("last_reset_month") != month_str:
+                        budget["spend_month"] = 0.0
+                        budget["last_reset_month"] = month_str
+                    w_conn.execute(
+                        """
                         UPDATE budgets 
                         SET spend_today = ?, last_reset_date = ?, 
                             spend_month = ?, last_reset_month = ?
                         WHERE api_key = ?
-                    """, (budget['spend_today'], budget['last_reset_date'],
-                          budget['spend_month'], budget['last_reset_month'], api_key))
+                    """,
+                        (
+                            budget["spend_today"],
+                            budget["last_reset_date"],
+                            budget["spend_month"],
+                            budget["last_reset_month"],
+                            api_key,
+                        ),
+                    )
                     w_conn.commit()
-            
+
         return budget
 
     async def record_request(
-        self, api_key: str, req_id: str, backend: str, model: str,
-        prompt_tokens: int, comp_tokens: int, cost: float, latency: float,
-        reserved_cost: float = 0.0
+        self,
+        api_key: str,
+        req_id: str,
+        backend: str,
+        model: str,
+        prompt_tokens: int,
+        comp_tokens: int,
+        cost: float,
+        latency: float,
+        reserved_cost: float = 0.0,
     ):
         await asyncio.to_thread(
             self._record_request_sync,
-            api_key, req_id, backend, model, prompt_tokens, comp_tokens,
-            cost, latency, reserved_cost
+            api_key,
+            req_id,
+            backend,
+            model,
+            prompt_tokens,
+            comp_tokens,
+            cost,
+            latency,
+            reserved_cost,
         )
 
     def _record_request_sync(
-        self, api_key: str, req_id: str, backend: str, model: str,
-        prompt_tokens: int, comp_tokens: int, cost: float, latency: float,
-        reserved_cost: float = 0.0
+        self,
+        api_key: str,
+        req_id: str,
+        backend: str,
+        model: str,
+        prompt_tokens: int,
+        comp_tokens: int,
+        cost: float,
+        latency: float,
+        reserved_cost: float = 0.0,
     ):
         with self._write_lock:
             conn = self._get_connection()
-            conn.execute("""
+            conn.execute(
+                """
                 INSERT INTO requests (id, api_key, backend, model, prompt_tokens, completion_tokens, cost_usd, latency_ms)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (req_id, api_key, backend, model, prompt_tokens, comp_tokens, cost, latency))
+            """,
+                (
+                    req_id,
+                    api_key,
+                    backend,
+                    model,
+                    prompt_tokens,
+                    comp_tokens,
+                    cost,
+                    latency,
+                ),
+            )
 
             # The reservation already pre-incremented spend by reserved_cost.
             # Apply the delta between actual cost and the reservation.
             delta = cost - reserved_cost
-            conn.execute("""
+            conn.execute(
+                """
                 UPDATE budgets 
                 SET spend_today = spend_today + ?, spend_month = spend_month + ?
                 WHERE api_key = ?
-            """, (delta, delta, api_key))
+            """,
+                (delta, delta, api_key),
+            )
             conn.commit()
 
-    async def get_circuit_breaker_state(self, backend_id: str) -> Optional[Dict[str, Any]]:
+    async def get_circuit_breaker_state(
+        self, backend_id: str
+    ) -> Optional[Dict[str, Any]]:
         return await asyncio.to_thread(self._get_circuit_breaker_state_sync, backend_id)
 
-    def _get_circuit_breaker_state_sync(self, backend_id: str) -> Optional[Dict[str, Any]]:
+    def _get_circuit_breaker_state_sync(
+        self, backend_id: str
+    ) -> Optional[Dict[str, Any]]:
         conn = self._get_connection()
-        row = conn.execute("SELECT * FROM circuit_breakers WHERE backend_id = ?", (backend_id,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM circuit_breakers WHERE backend_id = ?", (backend_id,)
+        ).fetchone()
         return dict(row) if row else None
 
-    async def update_circuit_breaker_state(self, backend_id: str, state: str, consecutive_failures: int, last_failure_time: float):
+    async def update_circuit_breaker_state(
+        self,
+        backend_id: str,
+        state: str,
+        consecutive_failures: int,
+        last_failure_time: float,
+    ):
         await asyncio.to_thread(
             self._update_circuit_breaker_state_sync,
-            backend_id, state, consecutive_failures, last_failure_time
+            backend_id,
+            state,
+            consecutive_failures,
+            last_failure_time,
         )
 
-    def _update_circuit_breaker_state_sync(self, backend_id: str, state: str, consecutive_failures: int, last_failure_time: float):
+    def _update_circuit_breaker_state_sync(
+        self,
+        backend_id: str,
+        state: str,
+        consecutive_failures: int,
+        last_failure_time: float,
+    ):
         with self._write_lock:
             conn = self._get_connection()
-            conn.execute("""
+            conn.execute(
+                """
                 INSERT INTO circuit_breakers (backend_id, state, consecutive_failures, last_failure_time)
                 VALUES (?, ?, ?, ?)
                 ON CONFLICT(backend_id) DO UPDATE SET
                 state=excluded.state,
                 consecutive_failures=excluded.consecutive_failures,
                 last_failure_time=excluded.last_failure_time
-            """, (backend_id, state, consecutive_failures, last_failure_time))
+            """,
+                (backend_id, state, consecutive_failures, last_failure_time),
+            )
             conn.commit()
 
     async def get_all_budgets(self) -> list:
@@ -246,7 +330,9 @@ class LedgerStore(BaseLedgerStore):
 
     def _get_all_budgets_sync(self) -> list:
         conn = self._get_connection()
-        rows = conn.execute("SELECT api_key, daily_limit_usd, spend_today, monthly_limit_usd, spend_month FROM budgets").fetchall()
+        rows = conn.execute(
+            "SELECT api_key, daily_limit_usd, spend_today, monthly_limit_usd, spend_month FROM budgets"
+        ).fetchall()
         return [dict(r) for r in rows]
 
     async def get_all_requests(self, limit: int = 50) -> list:
@@ -256,7 +342,7 @@ class LedgerStore(BaseLedgerStore):
         conn = self._get_connection()
         rows = conn.execute(
             "SELECT id, api_key, backend, model, cost_usd, latency_ms, timestamp FROM requests ORDER BY timestamp DESC LIMIT ?",
-            (limit,)
+            (limit,),
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -265,31 +351,64 @@ class LedgerStore(BaseLedgerStore):
 
     def _get_all_circuit_breakers_sync(self) -> list:
         conn = self._get_connection()
-        rows = conn.execute("SELECT backend_id, state, consecutive_failures, last_failure_time FROM circuit_breakers").fetchall()
+        rows = conn.execute(
+            "SELECT backend_id, state, consecutive_failures, last_failure_time FROM circuit_breakers"
+        ).fetchall()
         return [dict(r) for r in rows]
 
-    async def update_budget_limits(self, api_key: str, daily_limit_usd: float, monthly_limit_usd: float, requests_per_minute: Optional[int] = None) -> bool:
-        return await asyncio.to_thread(self._update_budget_limits_sync, api_key, daily_limit_usd, monthly_limit_usd, requests_per_minute)
+    async def update_budget_limits(
+        self,
+        api_key: str,
+        daily_limit_usd: float,
+        monthly_limit_usd: float,
+        requests_per_minute: Optional[int] = None,
+    ) -> bool:
+        return await asyncio.to_thread(
+            self._update_budget_limits_sync,
+            api_key,
+            daily_limit_usd,
+            monthly_limit_usd,
+            requests_per_minute,
+        )
 
-    def _update_budget_limits_sync(self, api_key: str, daily_limit_usd: float, monthly_limit_usd: float, requests_per_minute: Optional[int] = None) -> bool:
+    def _update_budget_limits_sync(
+        self,
+        api_key: str,
+        daily_limit_usd: float,
+        monthly_limit_usd: float,
+        requests_per_minute: Optional[int] = None,
+    ) -> bool:
         with self._write_lock:
             conn = self._get_connection()
             # Check if key exists
-            row = conn.execute("SELECT api_key, requests_per_minute FROM budgets WHERE api_key = ?", (api_key,)).fetchone()
-            rpm = requests_per_minute if requests_per_minute is not None else (row[1] if row else 60)
+            row = conn.execute(
+                "SELECT api_key, requests_per_minute FROM budgets WHERE api_key = ?",
+                (api_key,),
+            ).fetchone()
+            rpm = (
+                requests_per_minute
+                if requests_per_minute is not None
+                else (row[1] if row else 60)
+            )
             if row:
-                conn.execute("""
+                conn.execute(
+                    """
                     UPDATE budgets 
                     SET daily_limit_usd = ?, monthly_limit_usd = ?, requests_per_minute = ?
                     WHERE api_key = ?
-                """, (daily_limit_usd, monthly_limit_usd, rpm, api_key))
+                """,
+                    (daily_limit_usd, monthly_limit_usd, rpm, api_key),
+                )
                 conn.commit()
                 return True
             else:
-                conn.execute("""
+                conn.execute(
+                    """
                     INSERT INTO budgets (api_key, daily_limit_usd, monthly_limit_usd, requests_per_minute, spend_today, spend_month)
                     VALUES (?, ?, ?, ?, 0.0, 0.0)
-                """, (api_key, daily_limit_usd, monthly_limit_usd, rpm))
+                """,
+                    (api_key, daily_limit_usd, monthly_limit_usd, rpm),
+                )
                 conn.commit()
                 return False
 
@@ -320,34 +439,42 @@ class LedgerStore(BaseLedgerStore):
 
             budget = dict(row)
             now_utc = datetime.now(timezone.utc)
-            today_str = now_utc.strftime('%Y-%m-%d')
-            month_str = now_utc.strftime('%Y-%m')
+            today_str = now_utc.strftime("%Y-%m-%d")
+            month_str = now_utc.strftime("%Y-%m")
 
             needs_reset = False
-            if budget.get('last_reset_date') != today_str:
-                budget['spend_today'] = 0.0
-                budget['last_reset_date'] = today_str
+            if budget.get("last_reset_date") != today_str:
+                budget["spend_today"] = 0.0
+                budget["last_reset_date"] = today_str
                 needs_reset = True
-            if budget.get('last_reset_month') != month_str:
-                budget['spend_month'] = 0.0
-                budget['last_reset_month'] = month_str
+            if budget.get("last_reset_month") != month_str:
+                budget["spend_month"] = 0.0
+                budget["last_reset_month"] = month_str
                 needs_reset = True
 
             if needs_reset:
-                conn.execute("""
+                conn.execute(
+                    """
                     UPDATE budgets
                     SET spend_today = ?, last_reset_date = ?,
                         spend_month = ?, last_reset_month = ?
                     WHERE api_key = ?
-                """, (
-                    budget['spend_today'], budget['last_reset_date'],
-                    budget['spend_month'], budget['last_reset_month'],
-                    api_key,
-                ))
+                """,
+                    (
+                        budget["spend_today"],
+                        budget["last_reset_date"],
+                        budget["spend_month"],
+                        budget["last_reset_month"],
+                        api_key,
+                    ),
+                )
 
             # ── 2. Check limits ──────────────────────────────────────────────
-            projected_daily = budget['spend_today'] + estimated_cost
-            if budget['daily_limit_usd'] and projected_daily > budget['daily_limit_usd']:
+            projected_daily = budget["spend_today"] + estimated_cost
+            if (
+                budget["daily_limit_usd"]
+                and projected_daily > budget["daily_limit_usd"]
+            ):
                 conn.commit()  # commit any reset
                 raise BudgetExceededException(
                     f"Daily budget exceeded. "
@@ -355,8 +482,11 @@ class LedgerStore(BaseLedgerStore):
                     f"Projected: ${projected_daily:.6f}"
                 )
 
-            projected_monthly = budget['spend_month'] + estimated_cost
-            if budget['monthly_limit_usd'] and projected_monthly > budget['monthly_limit_usd']:
+            projected_monthly = budget["spend_month"] + estimated_cost
+            if (
+                budget["monthly_limit_usd"]
+                and projected_monthly > budget["monthly_limit_usd"]
+            ):
                 conn.commit()
                 raise BudgetExceededException(
                     f"Monthly budget exceeded. "
@@ -365,16 +495,19 @@ class LedgerStore(BaseLedgerStore):
                 )
 
             # ── 3. Reserve – atomically increment spend ──────────────────────
-            conn.execute("""
+            conn.execute(
+                """
                 UPDATE budgets
                 SET spend_today = spend_today + ?,
                     spend_month = spend_month + ?
                 WHERE api_key = ?
-            """, (estimated_cost, estimated_cost, api_key))
+            """,
+                (estimated_cost, estimated_cost, api_key),
+            )
             conn.commit()
 
-            budget['spend_today'] = projected_daily
-            budget['spend_month'] = projected_monthly
+            budget["spend_today"] = projected_daily
+            budget["spend_month"] = projected_monthly
             return budget
 
     def get_all_api_keys_sync(self) -> list:
@@ -384,7 +517,9 @@ class LedgerStore(BaseLedgerStore):
 
     def get_all_api_keys_and_limits_sync(self) -> list:
         conn = self._get_connection()
-        rows = conn.execute("SELECT api_key, requests_per_minute FROM budgets").fetchall()
+        rows = conn.execute(
+            "SELECT api_key, requests_per_minute FROM budgets"
+        ).fetchall()
         return [{"api_key": r[0], "requests_per_minute": r[1]} for r in rows]
 
     async def check_rate_limit(self, api_key: str) -> None:
@@ -400,6 +535,7 @@ class LedgerStore(BaseLedgerStore):
 
     def _check_rate_limit_sync(self, api_key: str) -> None:
         import time
+
         from fastapi import HTTPException
 
         now = time.time()
@@ -455,5 +591,3 @@ class LedgerStore(BaseLedgerStore):
                 except Exception:
                     pass
                 self._memory_conn = None
-
-

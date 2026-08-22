@@ -1,7 +1,9 @@
-from fastapi import Security, HTTPException, status
-from fastapi.security import APIKeyHeader
-from gateway import load_config
 import os
+
+from fastapi import HTTPException, Security, status
+from fastapi.security import APIKeyHeader
+
+from gateway import load_config
 
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 
@@ -33,28 +35,37 @@ def load_api_keys(ledger_store=None) -> None:
             VALID_API_KEYS.update(r["api_key"] for r in records)
 
             RATE_LIMIT_RULES.clear()
-            RATE_LIMIT_RULES.update({r["api_key"]: r["requests_per_minute"] for r in records})
+            RATE_LIMIT_RULES.update(
+                {r["api_key"]: r["requests_per_minute"] for r in records}
+            )
             return
         except Exception:
             pass  # fallback to config file
 
-    raw_env_budgets = os.environ.get("GATEWAY_BUDGETS_JSON") or os.environ.get("GATEWAY_BUDGETS")
+    raw_env_budgets = os.environ.get("GATEWAY_BUDGETS_JSON") or os.environ.get(
+        "GATEWAY_BUDGETS"
+    )
     if raw_env_budgets:
         try:
             import json
+
             parsed = json.loads(raw_env_budgets)
-            budgets = parsed.get("budgets", parsed) if isinstance(parsed, dict) else parsed
+            budgets = (
+                parsed.get("budgets", parsed) if isinstance(parsed, dict) else parsed
+            )
             VALID_API_KEYS.clear()
             VALID_API_KEYS.update(b["api_key"] for b in budgets)
             RATE_LIMIT_RULES.clear()
-            RATE_LIMIT_RULES.update({b["api_key"]: b.get("requests_per_minute", 60) for b in budgets})
+            RATE_LIMIT_RULES.update(
+                {b["api_key"]: b.get("requests_per_minute", 60) for b in budgets}
+            )
             return
         except Exception:
             pass
 
     config_path = os.environ.get(
         "BUDGETS_CONFIG_PATH",
-        os.path.join(os.path.dirname(__file__), "..", "configs", "budgets.yaml")
+        os.path.join(os.path.dirname(__file__), "..", "configs", "budgets.yaml"),
     )
     try:
         budgets = load_config(config_path).get("budgets", [])
@@ -62,7 +73,9 @@ def load_api_keys(ledger_store=None) -> None:
         VALID_API_KEYS.update(b["api_key"] for b in budgets)
 
         RATE_LIMIT_RULES.clear()
-        RATE_LIMIT_RULES.update({b["api_key"]: b.get("requests_per_minute", 60) for b in budgets})
+        RATE_LIMIT_RULES.update(
+            {b["api_key"]: b.get("requests_per_minute", 60) for b in budgets}
+        )
     except Exception:
         VALID_API_KEYS.clear()
         RATE_LIMIT_RULES.clear()

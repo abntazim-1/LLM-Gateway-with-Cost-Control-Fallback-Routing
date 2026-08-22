@@ -1,17 +1,19 @@
 import logging
 from contextlib import contextmanager
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
 try:
     from opentelemetry import trace
     from opentelemetry.trace import Status, StatusCode
+
     HAS_OPENTELEMETRY = True
     tracer = trace.get_tracer("gateway.tracer", "0.1.0")
 except ImportError:
     HAS_OPENTELEMETRY = False
     tracer = None
+
 
 class GatewayTracer:
     """OpenTelemetry instrumentation wrapper with graceful fallback if OpenTelemetry packages are omitted."""
@@ -27,7 +29,10 @@ class GatewayTracer:
             if attributes:
                 for k, v in attributes.items():
                     if v is not None:
-                        span.set_attribute(k, str(v) if not isinstance(v, (int, float, bool, str)) else v)
+                        span.set_attribute(
+                            k,
+                            str(v) if not isinstance(v, (int, float, bool, str)) else v,
+                        )
             try:
                 yield span
             except Exception as e:

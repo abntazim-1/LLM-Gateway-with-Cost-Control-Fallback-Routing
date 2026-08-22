@@ -1,18 +1,25 @@
 import re
-from typing import List, Dict, Tuple
+from typing import Dict, List, Tuple
+
 
 class PiiVault:
     """Reversible PII Anonymizer Vault for masking sensitive tokens before sending to LLMs."""
 
     def __init__(self):
         self.patterns = {
-            "EMAIL": re.compile(r"\b[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9.-]*[a-zA-Z0-9-]\b"),
+            "EMAIL": re.compile(
+                r"\b[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9.-]*[a-zA-Z0-9-]\b"
+            ),
             "CREDIT_CARD": re.compile(r"\b(?:\d[ -]*?){13,16}\b"),
-            "PHONE": re.compile(r"\b(?:\+?\d{1,3}[- ]?)?\(?\d{3}\)?[- ]?\d{3}[- ]?\d{4}\b"),
+            "PHONE": re.compile(
+                r"\b(?:\+?\d{1,3}[- ]?)?\(?\d{3}\)?[- ]?\d{3}[- ]?\d{4}\b"
+            ),
             "SSN": re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
             "AWS_KEY": re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
-            "JWT": re.compile(r"\beyJ[a-zA-Z0-9_\-]*\.[a-zA-Z0-9_\-]*\.[a-zA-Z0-9_\-]*\b"),
-            "BEARER": re.compile(r"\bBearer\s+[a-zA-Z0-9_\-\.]{20,}\b")
+            "JWT": re.compile(
+                r"\beyJ[a-zA-Z0-9_\-]*\.[a-zA-Z0-9_\-]*\.[a-zA-Z0-9_\-]*\b"
+            ),
+            "BEARER": re.compile(r"\bBearer\s+[a-zA-Z0-9_\-\.]{20,}\b"),
         }
 
     def mask_text(self, text: str) -> Tuple[str, Dict[str, str]]:
@@ -31,11 +38,15 @@ class PiiVault:
                 counters[label] = counters.get(label, 0) + 1
                 token = f"[{label}_{counters[label]}]"
                 vault_mapping[token] = val
-                sanitized = sanitized[:match.start()] + token + sanitized[match.end():]
+                sanitized = (
+                    sanitized[: match.start()] + token + sanitized[match.end() :]
+                )
 
         return sanitized, vault_mapping
 
-    def mask_messages(self, messages: List[Dict[str, str]]) -> Tuple[List[Dict[str, str]], Dict[str, str]]:
+    def mask_messages(
+        self, messages: List[Dict[str, str]]
+    ) -> Tuple[List[Dict[str, str]], Dict[str, str]]:
         """Mask PII across a full conversation. Placeholder counters are shared
         across messages so tokens stay unique and the merged mapping restores
         every occurrence correctly."""
@@ -46,7 +57,9 @@ class PiiVault:
         for msg in messages:
             content = msg.get("content", "")
             if not content:
-                masked_messages.append({"role": msg.get("role", ""), "content": content})
+                masked_messages.append(
+                    {"role": msg.get("role", ""), "content": content}
+                )
                 continue
 
             sanitized = content
@@ -57,7 +70,9 @@ class PiiVault:
                     counters[label] = counters.get(label, 0) + 1
                     token = f"[{label}_{counters[label]}]"
                     vault_mapping[token] = val
-                    sanitized = sanitized[:match.start()] + token + sanitized[match.end():]
+                    sanitized = (
+                        sanitized[: match.start()] + token + sanitized[match.end() :]
+                    )
 
             masked_messages.append({"role": msg.get("role", ""), "content": sanitized})
 
@@ -71,6 +86,7 @@ class PiiVault:
         for token, original_val in vault_mapping.items():
             restored = restored.replace(token, original_val)
         return restored
+
 
 class PiiSanitizer:
     """Enterprise-grade PII Sanitizer middleware for static regex redaction."""
@@ -89,8 +105,10 @@ class PiiSanitizer:
     def sanitize_messages(self, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
         sanitized_messages = []
         for msg in messages:
-            sanitized_messages.append({
-                "role": msg.get("role", ""),
-                "content": self.sanitize_text(msg.get("content", ""))
-            })
+            sanitized_messages.append(
+                {
+                    "role": msg.get("role", ""),
+                    "content": self.sanitize_text(msg.get("content", "")),
+                }
+            )
         return sanitized_messages

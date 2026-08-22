@@ -1,6 +1,7 @@
-import time
 import threading
-from typing import List, Dict, Optional
+import time
+from typing import Dict, List, Optional
+
 
 class ProviderKeyPool:
     """
@@ -8,10 +9,12 @@ class ProviderKeyPool:
     to bypass provider RPM/TPM throughput limits across multiple API accounts.
     """
 
-    def __init__(self, keys: Optional[List[str]] = None, default_cooldown_sec: float = 60.0):
+    def __init__(
+        self, keys: Optional[List[str]] = None, default_cooldown_sec: float = 60.0
+    ):
         self.keys: List[str] = [k.strip() for k in (keys or []) if k.strip()]
         self.default_cooldown_sec = default_cooldown_sec
-        self.cooldowns: Dict[str, float] = {} # key -> expire_timestamp
+        self.cooldowns: Dict[str, float] = {}  # key -> expire_timestamp
         self._index = 0
         self.lock = threading.Lock()
 
@@ -43,5 +46,7 @@ class ProviderKeyPool:
 
     def mark_rate_limited(self, key: str, cooldown_sec: Optional[float] = None):
         with self.lock:
-            duration = cooldown_sec if cooldown_sec is not None else self.default_cooldown_sec
+            duration = (
+                cooldown_sec if cooldown_sec is not None else self.default_cooldown_sec
+            )
             self.cooldowns[key] = time.time() + duration

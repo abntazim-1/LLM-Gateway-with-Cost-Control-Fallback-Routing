@@ -1,18 +1,27 @@
+import logging
 import time
 from enum import Enum
 from typing import Dict, Optional
-import logging
+
 from gateway.telemetry.metrics import CIRCUIT_BREAKER_STATE
 
 logger = logging.getLogger(__name__)
 
+
 class CircuitState(Enum):
-    CLOSED = "CLOSED"       # Healthy, requests flow normally
-    OPEN = "OPEN"           # Unhealthy, requests fail immediately
-    HALF_OPEN = "HALF_OPEN" # Testing recovery, 1 request allowed through
+    CLOSED = "CLOSED"  # Healthy, requests flow normally
+    OPEN = "OPEN"  # Unhealthy, requests fail immediately
+    HALF_OPEN = "HALF_OPEN"  # Testing recovery, 1 request allowed through
+
 
 class CircuitBreaker:
-    def __init__(self, backend_id: str, ledger, failure_threshold: int = 3, cooldown_sec: int = 30):
+    def __init__(
+        self,
+        backend_id: str,
+        ledger,
+        failure_threshold: int = 3,
+        cooldown_sec: int = 30,
+    ):
         self.backend_id = backend_id
         self.ledger = ledger
         self.failure_threshold = failure_threshold
@@ -22,15 +31,25 @@ class CircuitBreaker:
         if self.ledger:
             data = await self.ledger.get_circuit_breaker_state(self.backend_id)
             if data:
-                return CircuitState(data["state"]), data["consecutive_failures"], data["last_failure_time"]
+                return (
+                    CircuitState(data["state"]),
+                    data["consecutive_failures"],
+                    data["last_failure_time"],
+                )
         return CircuitState.CLOSED, 0, 0.0
 
-    async def _save_state(self, state: CircuitState, consecutive_failures: int, last_failure_time: float):
+    async def _save_state(
+        self, state: CircuitState, consecutive_failures: int, last_failure_time: float
+    ):
         if self.ledger:
             await self.ledger.update_circuit_breaker_state(
                 self.backend_id, state.value, consecutive_failures, last_failure_time
             )
-        val_map = {CircuitState.CLOSED: 0, CircuitState.HALF_OPEN: 1, CircuitState.OPEN: 2}
+        val_map = {
+            CircuitState.CLOSED: 0,
+            CircuitState.HALF_OPEN: 1,
+            CircuitState.OPEN: 2,
+        }
         CIRCUIT_BREAKER_STATE.labels(backend=self.backend_id).set(val_map[state])
 
     async def get_state(self) -> CircuitState:
@@ -49,34 +68,42 @@ class CircuitBreaker:
         state, consecutive_failures, _ = await self._get_state()
         consecutive_failures += 1
         last_failure_time = time.time()
-        
-        if state == CircuitState.HALF_OPEN or consecutive_failures >= self.failure_threshold:
+
+        if (
+            state == CircuitState.HALF_OPEN
+            or consecutive_failures >= self.failure_threshold
+        ):
             if state != CircuitState.OPEN:
-                logger.warning(f"Circuit breaker opened! Failures: {consecutive_failures}")
+                logger.warning(
+                    f"Circuit breaker opened! Failures: {consecutive_failures}"
+                )
             state = CircuitState.OPEN
-            
+
         await self._save_state(state, consecutive_failures, last_failure_time)
 
     async def can_request(self) -> bool:
         """Determines if a request should be allowed through the circuit breaker."""
         state, consecutive_failures, last_failure_time = await self._get_state()
-        
+
         if state == CircuitState.CLOSED:
             return True
-            
+
         if state == CircuitState.OPEN:
             # Check if cooldown has elapsed
             if time.time() - last_failure_time >= self.cooldown_sec:
                 logger.info("Circuit breaker half-open. Testing recovery.")
-                await self._save_state(CircuitState.HALF_OPEN, consecutive_failures, last_failure_time)
+                await self._save_state(
+                    CircuitState.HALF_OPEN, consecutive_failures, last_failure_time
+                )
                 return True
             return False
-            
+
         if state == CircuitState.HALF_OPEN:
             # Already let one through to test, deny others until that one resolves
             return False
-            
+
         return False
+
 
 class CircuitBreakerRegistry:
     def __init__(self, ledger, failure_threshold: int = 3, cooldown_sec: int = 30):
@@ -91,6 +118,6 @@ class CircuitBreakerRegistry:
                 backend_id=backend_id,
                 ledger=self.ledger,
                 failure_threshold=self.failure_threshold,
-                cooldown_sec=self.cooldown_sec
+                cooldown_sec=self.cooldown_sec,
             )
         return self._breakers[backend_id]
