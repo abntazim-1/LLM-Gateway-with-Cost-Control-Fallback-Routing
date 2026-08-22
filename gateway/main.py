@@ -101,6 +101,26 @@ def _key_hash(api_key: str) -> str:
     return hashlib.sha256(api_key.encode()).hexdigest()[:16]
 
 
+def _stream_headers(
+    request_id: str, backend_id: Optional[str] = None
+) -> Dict[str, str]:
+    """Headers for a StreamingResponse.
+
+    FastAPI merges headers set on the injected `Response` only when the
+    endpoint returns a plain value; returning a StreamingResponse directly
+    discards them. Streamed requests were therefore carrying no X-Request-ID
+    at all, leaving callers unable to correlate a stream with the ledger — or
+    to attach feedback to it.
+
+    The serving backend generally isn't known until the stream has started, so
+    it is only set where it is known up front (a cache hit).
+    """
+    headers = {"X-Request-ID": request_id}
+    if backend_id:
+        headers["X-Backend-Id"] = backend_id
+    return headers
+
+
 def _find_adapter(router: Router, backend_id: str) -> Optional[BaseAdapter]:
     """Look up the adapter that served a request, if it's still registered."""
     return next((a for a in router.adapters if a.id == backend_id), None)
@@ -594,7 +614,9 @@ async def chat_completions(
                 yield "data: [DONE]\n\n"
 
             return StreamingResponse(
-                cached_stream_generator(), media_type="text/event-stream"
+                cached_stream_generator(),
+                media_type="text/event-stream",
+                headers=_stream_headers(request_id, backend_id="cache"),
             )
         if vault_mapping:
             # Restore on a copy — the cache entry must stay in masked form so
@@ -889,7 +911,11 @@ async def chat_completions(
                                 f"reservation: {ledger_err}"
                             )
 
-        return StreamingResponse(stream_generator(), media_type="text/event-stream")
+        return StreamingResponse(
+            stream_generator(),
+            media_type="text/event-stream",
+            headers=_stream_headers(request_id),
+        )
 
     with GatewayTracer.trace_span(
         "chat.completion",

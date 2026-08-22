@@ -103,6 +103,31 @@ def _stream_once(client, api_key, content="Reply with one word"):
             pass
 
 
+def test_stream_response_carries_request_id_header(client_and_key):
+    """Streams must be correlatable to the ledger like any other request.
+
+    FastAPI only merges headers set on the injected Response when the endpoint
+    returns a plain value; returning StreamingResponse directly dropped them,
+    so streamed calls carried no X-Request-ID — which also made it impossible
+    to attach quality feedback to them.
+    """
+    client, api_key = client_and_key
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}"},
+        json={
+            "messages": [{"role": "user", "content": "header check"}],
+            "stream": True,
+            "max_tokens": 16,
+        },
+    ) as r:
+        assert r.status_code == 200
+        assert r.headers.get("X-Request-ID"), "stream is missing X-Request-ID"
+        for _ in r.iter_lines():
+            pass
+
+
 def test_stream_is_not_billed_at_the_max_tokens_ceiling(client_and_key):
     client, api_key = client_and_key
     _stream_once(client, api_key)
