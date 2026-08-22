@@ -869,6 +869,13 @@ async def chat_completions(
                 backend_response.latency_ms,
                 backend_response.cost_usd,
             )
+            # Which backend actually answered. The body's `model` field says
+            # this too, but a caller that asked for one model and silently got
+            # another has no way to notice without an explicit signal.
+            response.headers["X-Backend-Id"] = backend_response.backend_id
+            response.headers["X-Backend-Model"] = backend_response.model
+            if backend_response.is_fallback:
+                response.headers["X-Backend-Fallback"] = "true"
         except ContextLengthExceededException as e:
             observe_request("unknown", "error", 0.0, 0.0)
             raise HTTPException(status_code=400, detail=str(e))
@@ -909,6 +916,26 @@ async def chat_completions(
             if span:
                 span.set_attribute("guardrail_violation", True)
             raise HTTPException(status_code=400, detail=str(e))
+
+        # JSON mode was used to *route* to a capable backend but the output
+        # was never checked, so prose — or a ```json fenced block, which is
+        # not itself valid JSON — passed through as success. Unwrap fences
+        # where possible and flag what remains unparseable.
+        if state.guardrails_pipeline.json_requested(kwargs):
+            repaired, all_valid = [], True
+            for content in sanitized_contents:
+                text, is_valid = state.guardrails_pipeline.repair_json(content)
+                repaired.append(text)
+                all_valid = all_valid and is_valid
+            sanitized_contents = repaired
+            if span:
+                span.set_attribute("json_valid", all_valid)
+            if not all_valid:
+                logger.warning(
+                    f"Backend {backend_response.backend_id} returned invalid "
+                    f"JSON for a json_mode request (request {request_id})"
+                )
+                response.headers["X-JSON-Valid"] = "false"
 
         if span:
             span.set_attribute("backend_id", backend_response.backend_id)

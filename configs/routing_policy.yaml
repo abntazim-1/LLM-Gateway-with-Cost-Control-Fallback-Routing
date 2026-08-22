@@ -1,5 +1,5 @@
 routing:
-  strategy: cascade  # cost_first, latency_first, complexity, round_robin, cascade
+  strategy: complexity  # cost_first, latency_first, complexity, round_robin, cascade
   fallback_enabled: true
   max_retries: 2
   min_tokens_for_complex: 500

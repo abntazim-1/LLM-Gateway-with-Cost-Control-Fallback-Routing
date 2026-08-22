@@ -1,5 +1,6 @@
+import json
 import re
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from gateway.policy.normalize import matching_variants
 
@@ -150,6 +151,51 @@ class GuardrailsPipeline:
         for label, pattern in self.output_secret_patterns.items():
             completion_text = pattern.sub(f"[{label}_REDACTED]", completion_text)
         return completion_text
+
+    @staticmethod
+    def json_requested(kwargs: Dict[str, Any]) -> bool:
+        """Whether the caller asked for JSON output."""
+        response_format = kwargs.get("response_format") or {}
+        return bool(
+            (
+                isinstance(response_format, dict)
+                and response_format.get("type") == "json_object"
+            )
+            or kwargs.get("json_mode", False)
+        )
+
+    @staticmethod
+    def repair_json(completion_text: str) -> Tuple[str, bool]:
+        """Return (text, is_valid_json), stripping markdown fences first.
+
+        Backends advertising `json_mode` were routed to on that basis but the
+        output was never checked, so a reply of prose — or the very common
+        ```json fenced block, which is not itself valid JSON — was passed
+        through as success. Unwrapping a fence is a safe, deterministic
+        repair; anything still unparseable is reported rather than fixed.
+        """
+        if not completion_text:
+            return completion_text, False
+
+        text = completion_text.strip()
+        try:
+            json.loads(text)
+            return text, True
+        except ValueError:
+            pass
+
+        fenced = re.match(
+            r"^```(?:json)?\s*\n?(.*?)\n?\s*```$", text, re.DOTALL | re.IGNORECASE
+        )
+        if fenced:
+            inner = fenced.group(1).strip()
+            try:
+                json.loads(inner)
+                return inner, True
+            except ValueError:
+                return completion_text, False
+
+        return completion_text, False
 
     def validate_completion(self, completion_text: str) -> None:
         """Validate output completion text against output guardrail rules.
