@@ -97,23 +97,29 @@ def _key_hash(api_key: str) -> str:
     return hashlib.sha256(api_key.encode()).hexdigest()[:16]
 
 
-def _count_tokens(messages: List[Dict[str, Any]], completion_text: str = "") -> tuple:
-    """Best-effort token counting: tiktoken when available, chars/4 otherwise."""
-    try:
-        import tiktoken
+def _find_adapter(router: Router, backend_id: str) -> Optional[BaseAdapter]:
+    """Look up the adapter that served a request, if it's still registered."""
+    return next((a for a in router.adapters if a.id == backend_id), None)
 
-        encoding = tiktoken.get_encoding("cl100k_base")
-        prompt_tokens = sum(
-            len(encoding.encode(m.get("content", ""))) for m in messages
-        )
-        completion_tokens = (
-            len(encoding.encode(completion_text)) if completion_text else 0
-        )
-    except Exception:
-        prompt_tokens = max(
-            1, int(sum(len(m.get("content", "")) for m in messages) / 4.0)
-        )
-        completion_tokens = max(0, int(len(completion_text) / 4.0))
+
+def _count_tokens(
+    messages: List[Dict[str, Any]],
+    completion_text: str = "",
+    adapter: Optional[BaseAdapter] = None,
+) -> tuple:
+    """Count tokens using the serving backend's own tokenizer.
+
+    Tokenizers differ per model — the same text can differ by 2x or more
+    between backends — so counts are delegated to the adapter whenever one is
+    known. Without an adapter (backend never selected, e.g. a stream that died
+    before any candidate was chosen) there is no correct tokenizer to use, so
+    this returns a rough char-based figure purely so error paths can still
+    release their budget reservation."""
+    if adapter is not None:
+        return adapter.count_tokens(messages, completion_text)
+
+    prompt_tokens = max(1, int(sum(len(m.get("content", "")) for m in messages) / 4.0))
+    completion_tokens = max(0, int(len(completion_text) / 4.0))
     return prompt_tokens, completion_tokens
 
 
@@ -121,7 +127,7 @@ def _adapter_cost(
     router: Router, backend_id: str, prompt_tokens: int, completion_tokens: int
 ) -> float:
     """Compute cost against the adapter that served the request, if known."""
-    adapter = next((a for a in router.adapters if a.id == backend_id), None)
+    adapter = _find_adapter(router, backend_id)
     if adapter is None:
         return 0.0
     return (prompt_tokens / 1000.0) * adapter.cost_per_1k_prompt + (
@@ -572,21 +578,13 @@ async def chat_completions(
             target_adapter = None
 
         if target_adapter:
-            try:
-                import tiktoken
+            prompt_tokens = target_adapter.count_prompt_tokens(sanitized_messages)
 
-                encoding = tiktoken.get_encoding("cl100k_base")
-                prompt_tokens = sum(
-                    len(encoding.encode(m.get("content", "")))
-                    for m in sanitized_messages
-                )
-            except ImportError:
-                approx_tokens = (
-                    sum(len(m.get("content", "")) for m in sanitized_messages) / 4.0
-                )
-                prompt_tokens = max(1, int(approx_tokens))
-
-            # Estimate completion tokens using request max_tokens or default to 256
+            # Reserve against max_tokens (the ceiling this request could
+            # reach) rather than a guess at actual length — under-reserving
+            # would let a request slip past a budget it then exceeds. The
+            # reservation is reconciled down to real usage once the response
+            # completes, so a high ceiling costs headroom, not money.
             completion_tokens = body.get("max_tokens", 256)
 
             prompt_cost = (prompt_tokens / 1000.0) * target_adapter.cost_per_1k_prompt
@@ -658,14 +656,22 @@ async def chat_completions(
                     # ── Spend recording ────────────────────────────────────────
                     latency_ms = (time.time() - stream_start) * 1000.0
 
+                    serving_adapter = _find_adapter(state.router, stream_backend_id)
                     prompt_tokens_count, completion_tokens_count = _count_tokens(
-                        sanitized_messages, accumulated_text
+                        sanitized_messages, accumulated_text, adapter=serving_adapter
                     )
                     completion_tokens_count = max(1, completion_tokens_count)
 
-                    # Use estimated_cost as actual cost for streams (no usage object)
-                    # because we reserved it upfront; delta will be 0.
-                    actual_cost = estimated_cost
+                    # Streams carry no usage object, so bill from what was
+                    # actually generated. Billing the reservation instead
+                    # (which is sized to max_tokens) charged every stream its
+                    # ceiling regardless of how little it produced.
+                    actual_cost = _adapter_cost(
+                        state.router,
+                        stream_backend_id,
+                        prompt_tokens_count,
+                        completion_tokens_count,
+                    )
 
                     observe_request(
                         stream_backend_id, "success", latency_ms, actual_cost
@@ -726,7 +732,9 @@ async def chat_completions(
                     logging.error(f"Streaming timeout: {e}")
                     try:
                         p_tok, c_tok = _count_tokens(
-                            sanitized_messages, accumulated_text
+                            sanitized_messages,
+                            accumulated_text,
+                            adapter=_find_adapter(state.router, stream_backend_id),
                         )
                         # Record the partial spend so record_request reconciles
                         # (releases) the amount reserved in the preflight check.
@@ -756,7 +764,9 @@ async def chat_completions(
                     logging.error(f"Streaming error: {e}")
                     try:
                         p_tok, c_tok = _count_tokens(
-                            sanitized_messages, accumulated_text
+                            sanitized_messages,
+                            accumulated_text,
+                            adapter=_find_adapter(state.router, stream_backend_id),
                         )
                         await state.ledger_queue.record_request(
                             api_key=api_key,
@@ -787,7 +797,9 @@ async def chat_completions(
                     if not reconciled:
                         try:
                             p_tok, c_tok = _count_tokens(
-                                sanitized_messages, accumulated_text
+                                sanitized_messages,
+                                accumulated_text,
+                                adapter=_find_adapter(state.router, stream_backend_id),
                             )
                             await state.ledger_queue.record_request(
                                 api_key=api_key,

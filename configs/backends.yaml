@@ -1,3 +1,8 @@
+# token_overhead_per_message accounts for the chat-template scaffolding the
+# provider bills on top of raw content tokens (role markers, delimiters, and
+# any default system block baked into the model's template). It is measured
+# per model — re-derive with `python docs/probes/probe_tokens.py` after adding
+# or changing a backend.
 backends:
   - id: local-ollama-phi3
     provider: ollama
@@ -5,6 +10,8 @@ backends:
     endpoint: "http://localhost:11434/v1"
     cost_per_1k_prompt: 0.0001
     cost_per_1k_completion: 0.0002
+    tokenizer: cl100k_base
+    token_overhead_per_message: 7
     capabilities:
       - json_mode
     context_length: 8192
@@ -15,6 +22,10 @@ backends:
     endpoint: "http://localhost:11434/v1"
     cost_per_1k_prompt: 0.0010
     cost_per_1k_completion: 0.0020
+    tokenizer: cl100k_base
+    # Qwen's template ships a default system block, so its fixed overhead is
+    # far larger than the OpenAI-style default of 4.
+    token_overhead_per_message: 26
     capabilities:
       - json_mode
     context_length: 8192

@@ -1,8 +1,24 @@
+import logging
 import time
 from abc import ABC, abstractmethod
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
+import tiktoken
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
+
+# Loaded encodings are process-wide and immutable, so cache them rather than
+# paying the (network-backed, first-time) load cost on every request.
+_ENCODING_CACHE: Dict[str, Any] = {}
+
+# Chat models don't bill raw content tokens — the provider wraps each message
+# in role/delimiter scaffolding and primes the reply, and bills that too.
+# These are OpenAI's documented per-message and per-reply constants; models
+# with heavier templates (Qwen ships a default system block, for example)
+# should override `token_overhead_per_message` in their backend config.
+DEFAULT_TOKEN_OVERHEAD_PER_MESSAGE = 4
+REPLY_PRIMING_TOKENS = 3
 
 
 class NormalizedMessage(BaseModel):
@@ -35,6 +51,10 @@ class BaseAdapter(ABC):
         self.endpoint = config.get("endpoint", "")
         self.cost_per_1k_prompt = config.get("cost_per_1k_prompt", 0.0)
         self.cost_per_1k_completion = config.get("cost_per_1k_completion", 0.0)
+        self.tokenizer_name = config.get("tokenizer", "cl100k_base")
+        self.token_overhead_per_message = config.get(
+            "token_overhead_per_message", DEFAULT_TOKEN_OVERHEAD_PER_MESSAGE
+        )
         import httpx
 
         self.client = httpx.AsyncClient(
@@ -51,6 +71,55 @@ class BaseAdapter(ABC):
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()
+
+    def _get_encoding(self):
+        """Resolve this backend's tokenizer, caching it process-wide.
+
+        Falls back to cl100k_base for an unrecognised tokenizer name rather
+        than failing the request — but logs it, because a silently wrong
+        tokenizer means silently wrong cost estimates."""
+        name = self.tokenizer_name
+        if name not in _ENCODING_CACHE:
+            try:
+                _ENCODING_CACHE[name] = tiktoken.get_encoding(name)
+            except Exception as e:
+                logger.warning(
+                    f"Unknown tokenizer '{name}' for backend {self.id} "
+                    f"({e}); falling back to cl100k_base. Token counts and "
+                    f"cost estimates for this backend may be inaccurate."
+                )
+                _ENCODING_CACHE[name] = tiktoken.get_encoding("cl100k_base")
+        return _ENCODING_CACHE[name]
+
+    def count_prompt_tokens(self, messages: List[Dict[str, Any]]) -> int:
+        """Estimate the billable prompt tokens for `messages` on this backend.
+
+        This is an estimate used for the pre-flight budget reservation; the
+        reservation is later reconciled against the provider's own reported
+        usage where available. It is deliberately per-adapter: tokenizers are
+        a property of the model, not of the gateway."""
+        encoding = self._get_encoding()
+        total = REPLY_PRIMING_TOKENS
+        for m in messages:
+            content = m.get("content") or ""
+            total += self.token_overhead_per_message
+            total += len(encoding.encode(str(content)))
+        return max(1, total)
+
+    def count_completion_tokens(self, text: str) -> int:
+        """Estimate billable completion tokens for generated `text`."""
+        if not text:
+            return 0
+        return len(self._get_encoding().encode(text))
+
+    def count_tokens(
+        self, messages: List[Dict[str, Any]], completion_text: str = ""
+    ) -> Tuple[int, int]:
+        """Convenience pair of (prompt_tokens, completion_tokens)."""
+        return (
+            self.count_prompt_tokens(messages),
+            self.count_completion_tokens(completion_text),
+        )
 
     def _calculate_cost(self, prompt_tokens: int, completion_tokens: int) -> float:
         prompt_cost = (prompt_tokens / 1000.0) * self.cost_per_1k_prompt
