@@ -9,31 +9,71 @@ from gateway.policy.circuit_breaker import CircuitBreakerRegistry
 
 logger = logging.getLogger(__name__)
 
-# Word-boundary patterns for complex reasoning and engineering domains
-COMPLEX_PATTERNS = [
-    re.compile(
-        r"\b(optimize|optimization|benchmark|benchmarking|refactor|refactoring)\b",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"\b(proof|prove|theorem|derivation|differential|calculus|eigenvalue)\b",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"\b(debug|stacktrace|traceback|segmentation fault|memory leak|deadlock|race condition)\b",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"\b(algorithm|data structure|dynamic programming|complexity analysis)\b",
-        re.IGNORECASE,
-    ),
-    re.compile(r"```[a-zA-Z0-9_-]*\n[\s\S]+?```"),  # Embedded multi-line code block
-]
+# Domain vocabulary suggesting a request needs real reasoning. Matches are
+# counted INDIVIDUALLY, not per-group: grouping them meant a prompt saying
+# "optimize and refactor and benchmark" scored the same as one saying
+# "optimize" once, which is why such prompts routed to the cheap model.
+#
+# Coverage is inherently incomplete — these are software, maths, and a
+# sampling of professional domains. A hard question in a vocabulary not listed
+# here scores zero, which is the structural limit of lexical matching; see
+# F7 in docs/AI_ML_FLAWS.md.
+DOMAIN_TERMS = re.compile(
+    r"\b("
+    # software engineering
+    r"optimi[sz]e|optimi[sz]ation|benchmark\w*|refactor\w*|profil(?:e|ing)|"
+    r"concurren\w+|race\s+condition|deadlock|mutex|idempoten\w+|"
+    r"memory\s+leak|segmentation\s+fault|stack\s?trace|traceback|"
+    r"algorithm\w*|data\s+structure|dynamic\s+programming|complexity\s+analysis|"
+    r"time\s+complexity|space\s+complexity|throughput|latency|scalab\w+|"
+    r"cache\s+invalidation|stale\s+reads?|consistency|distributed|sharding|"
+    # maths / science
+    r"proof|prove|theorem|lemma|derivation|differential|calculus|eigenvalue|"
+    r"probabilit\w+|stochastic|regression|variance|entropy|"
+    # medicine
+    r"titrat\w+|contraindicat\w+|dosage|dosing|prognosis|diagnos\w+|"
+    r"pharmacokinetic\w*|comorbid\w*|"
+    # law / finance
+    r"liabilit\w+|indemnif\w+|jurisdiction|statutor\w+|arbitration|"
+    r"amorti[sz]\w+|hedg\w+|derivative\s+contract|valuation|solvency"
+    r")\b",
+    re.IGNORECASE,
+)
+
+CODE_BLOCK = re.compile(r"```[a-zA-Z0-9_-]*\n[\s\S]+?```")
+
+# Framing that signals analysis rather than recall — causal, comparative, or
+# conditional reasoning. Deliberately narrower than a bare "why": "why is the
+# sky blue" is recall, "why would X happen under Y" is analysis.
+ANALYTICAL_FRAMING = re.compile(
+    r"\bwhy\s+(would|might|could|does)\b[^.?!]*\b(when|under|if|despite|given|"
+    r"while|during|after|before)\b"
+    r"|\bwhat\s+causes?\b[^.?!]*\bto\b"
+    r"|\b(trade[- ]?offs?|compare|comparison|versus|vs\.?)\b"
+    r"|\bshould\s+\w+[^.?!]*\b(or|rather\s+than|instead\s+of|before|after)\b"
+    r"|\bunder\s+what\s+(conditions?|circumstances?)\b"
+    r"|\bhow\s+(would|might|does)\b[^.?!]*\baffect\b"
+    r"|\b(explain|walk\s+me\s+through)\s+(why|how)\b[^.?!]*\b(when|under|if|"
+    r"despite|given)\b",
+    re.IGNORECASE,
+)
 
 SIMPLE_PREFIXES = re.compile(
     r"^(why is|why are|why do|why does|what is|what are|how are|who is|who are|tell me about|explain simply)\b",
     re.IGNORECASE,
 )
+
+# Scoring weights and thresholds for _is_complex_request.
+_SCORE_CODE_BLOCK = 3
+_SCORE_ANALYTICAL = 2
+_SCORE_PER_DOMAIN_TERM = 1
+_MAX_DOMAIN_TERM_SCORE = 3
+_SCORE_LONG_INPUT = 2
+_COMPLEXITY_THRESHOLD = 3
+# Long input only counts as complex if it is actually substantive. Repeated
+# filler reaches any token threshold while containing nothing to reason about,
+# so require genuine lexical variety before length earns a score.
+_MIN_DISTINCT_WORDS_FOR_LENGTH = 40
 
 # Surface-level signals that a completion didn't actually answer the
 # request: a refusal/hedge, or an answer too short to plausibly be one.
@@ -87,45 +127,64 @@ class Router:
                     f"Error closing adapter {getattr(adapter, 'id', 'unknown')}: {e}"
                 )
 
-    def _is_complex_request(self, messages: Optional[List[Dict[str, str]]]) -> bool:
-        """Evaluate request complexity using token count thresholds and structured reasoning signals."""
+    def _complexity_score(self, messages: Optional[List[Dict[str, str]]]) -> int:
+        """Weighted complexity score for a request.
+
+        Additive scoring rather than the previous rule chain, because the
+        signals genuinely compound: a long prompt full of domain terms is
+        more likely to need a capable model than either alone. Each signal is
+        capped so no single one can dominate.
+        """
         if not messages:
-            return False
+            return 0
 
         contents = [
             m.get("content", "") for m in messages if isinstance(m.get("content"), str)
         ]
         full_prompt = " ".join(contents).strip()
         if not full_prompt:
-            return False
+            return 0
+
+        score = 0
+
+        if CODE_BLOCK.search(full_prompt):
+            score += _SCORE_CODE_BLOCK
+
+        # Count every occurrence, capped — three distinct domain terms is a
+        # stronger signal than one, which per-group matching could not express.
+        score += min(
+            len(DOMAIN_TERMS.findall(full_prompt)) * _SCORE_PER_DOMAIN_TERM,
+            _MAX_DOMAIN_TERM_SCORE,
+        )
+
+        if ANALYTICAL_FRAMING.search(full_prompt):
+            score += _SCORE_ANALYTICAL
 
         approx_tokens = len(full_prompt) / 4.0
-
-        # High token volume (long prompt / document / code review)
         if approx_tokens >= self.min_tokens_for_complex:
-            return True
+            distinct_words = len({w.lower() for w in re.findall(r"\w+", full_prompt)})
+            if distinct_words >= _MIN_DISTINCT_WORDS_FOR_LENGTH:
+                score += _SCORE_LONG_INPUT
 
-        # Disqualify simple conversational queries without code
-        first_user_msg = next(
-            (m.get("content", "").strip() for m in messages if m.get("role") == "user"),
-            "",
-        )
-        if (
-            approx_tokens < 60
-            and SIMPLE_PREFIXES.search(first_user_msg)
-            and not re.search(r"```", full_prompt)
-        ):
-            return False
+        # A short, plainly conversational question with no other signal is
+        # recall, not analysis — keep it on the cheap backend.
+        if score <= _SCORE_PER_DOMAIN_TERM and approx_tokens < 60:
+            first_user_msg = next(
+                (
+                    m.get("content", "").strip()
+                    for m in messages
+                    if m.get("role") == "user"
+                ),
+                "",
+            )
+            if SIMPLE_PREFIXES.search(first_user_msg):
+                return 0
 
-        # Embedded multi-line code block indicates programming task
-        if re.search(r"```[a-zA-Z0-9_-]*\n[\s\S]+?```", full_prompt):
-            return True
+        return score
 
-        # Count reasoning keyword matches with word boundaries
-        matches = sum(
-            1 for pattern in COMPLEX_PATTERNS[:-1] if pattern.search(full_prompt)
-        )
-        return matches >= 2 or (approx_tokens > 150 and matches >= 1)
+    def _is_complex_request(self, messages: Optional[List[Dict[str, str]]]) -> bool:
+        """Whether a request warrants a more capable (pricier) backend."""
+        return self._complexity_score(messages) >= _COMPLEXITY_THRESHOLD
 
     @staticmethod
     def _is_response_inadequate(response: NormalizedResponse) -> bool:

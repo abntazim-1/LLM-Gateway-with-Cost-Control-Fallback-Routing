@@ -123,14 +123,58 @@ async def test_router_complexity_routing_complex():
     )
     assert ranked_code[0].id == "premium-model"
 
-    # Large token volume routes to premium
-    large_prompt = "Analyze this text in detail: " + (
-        "lorem ipsum dolor sit amet " * 150
-    )
+    # Large token volume routes to premium.
+    # The text must be genuinely varied: length only counts toward complexity
+    # when the input is substantive, so that repeated filler cannot buy a
+    # premium model by padding alone (asserted separately below).
+    vocabulary = (
+        "quarterly revenue segment margin forecast headcount attrition pipeline "
+        "conversion retention churn expansion procurement logistics warehouse "
+        "inventory supplier contract renewal escalation compliance audit finding "
+        "remediation governance stakeholder roadmap milestone dependency risk "
+        "mitigation capacity utilisation throughput backlog velocity estimate "
+        "variance baseline benchmark target threshold deviation adjustment"
+    ).split()
+    large_prompt = "Analyze this report in detail: " + " ".join(vocabulary * 12)
     ranked_large = await router.get_ranked_adapters(
         messages=[{"role": "user", "content": large_prompt}]
     )
     assert ranked_large[0].id == "premium-model"
+
+
+@pytest.mark.asyncio
+async def test_padded_filler_does_not_route_to_premium():
+    """Length alone must not escalate: repeated filler reaches any token
+    threshold while containing nothing to reason about, so routing it to the
+    expensive model is pure waste."""
+    ledger = LedgerStore(":memory:")
+    registry = CircuitBreakerRegistry(ledger=ledger)
+
+    cheap = MockRoutingAdapter(
+        {
+            "id": "cheap-model",
+            "model": "m1",
+            "cost_per_1k_prompt": 0.001,
+            "cost_per_1k_completion": 0.002,
+        }
+    )
+    premium = MockRoutingAdapter(
+        {
+            "id": "premium-model",
+            "model": "m2",
+            "cost_per_1k_prompt": 0.01,
+            "cost_per_1k_completion": 0.02,
+        }
+    )
+    router = Router(
+        adapters=[premium, cheap], circuit_registry=registry, strategy="complexity"
+    )
+
+    for filler in ("hello " * 600, "lorem ipsum dolor sit amet " * 150):
+        ranked = await router.get_ranked_adapters(
+            messages=[{"role": "user", "content": filler}]
+        )
+        assert ranked[0].id == "cheap-model", f"padding escalated: {filler[:30]!r}"
 
 
 @pytest.mark.asyncio
