@@ -214,7 +214,10 @@ async def lifespan(app: FastAPI):
     global _state
 
     # Init ledger & async queue
-    ledger = LedgerStore("ledger.db")
+    # Configurable so a deployment can put the ledger on a mounted volume.
+    # Hosts with an ephemeral filesystem otherwise discard spend history on
+    # every redeploy, and the default only makes sense running from a checkout.
+    ledger = LedgerStore(os.environ.get("LEDGER_DB_PATH", "ledger.db"))
     ledger_queue = AsyncLedgerQueue(ledger)
     ledger_queue.start()
 

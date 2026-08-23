@@ -1,0 +1,58 @@
+# Render blueprint — https://render.com/docs/blueprint-spec
+#
+# Deploy: push this repo to GitHub, then Render → New → Blueprint → select it.
+# Set the secrets marked `sync: false` in the dashboard; they are deliberately
+# not in this file.
+#
+# Free-tier caveats worth knowing before you demo:
+#   * Instances sleep after ~15 minutes idle, so the first request after a
+#     lull takes ~30s to wake. Hit it once before showing anyone.
+#   * The filesystem is ephemeral. The SQLite ledger resets on every deploy
+#     and every wake — fine for a demo, wrong for anything real.
+
+services:
+  # ── Gateway API ───────────────────────────────────────────────────────
+  - type: web
+    name: llm-gateway
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      # Groq's free tier means a public demo costs nothing and visitors need
+      # no key of their own.
+      - key: GROQ_API_KEY
+        sync: false
+      # Authenticates /admin/*. Generate with:
+      #   python -c "import secrets; print(secrets.token_hex(32))"
+      - key: ADMIN_API_KEY
+        sync: false
+      # A capped key published in the README for visitors to try. Cap it from
+      # the dashboard once deployed — the budget and rate limiting are what
+      # make a public key safe to hand out.
+      - key: CLIENT_API_KEY_DEMO
+        sync: false
+      - key: BACKENDS_CONFIG_PATH
+        value: configs/backends.cloud.yaml
+      - key: LEDGER_DB_PATH
+        value: /app/data/ledger.db
+
+  # ── Operator dashboard (optional) ─────────────────────────────────────
+  # Comment this out if you only want the API. Note that it holds the admin
+  # token, so a public instance exposes operator controls — deploy it only if
+  # you accept that, or keep it local and point it at the gateway's URL.
+  - type: web
+    name: llm-gateway-dashboard
+    runtime: docker
+    dockerfilePath: ./dashboard.Dockerfile
+    plan: free
+    envVars:
+      - key: GATEWAY_URL
+        fromService:
+          type: web
+          name: llm-gateway
+          property: hostport
+      - key: ADMIN_API_KEY
+        sync: false
+      - key: CLIENT_API_KEY_DEMO
+        sync: false

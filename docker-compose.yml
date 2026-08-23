@@ -1,20 +1,39 @@
-version: '3.8'
+# Local container stack: gateway + operator dashboard.
+#
+#   docker compose up --build
+#
+# Runs against cloud backends by default because a container cannot reach an
+# Ollama instance on the host without extra plumbing. Supply GROQ_API_KEY in
+# a .env file beside this one; Compose reads it automatically.
+#
+# To run against local Ollama instead, set BACKENDS_CONFIG_PATH to
+# configs/backends.yaml and point the endpoints in it at
+# host.docker.internal:11434 rather than localhost.
 
 services:
   gateway:
-    build: 
+    build:
       context: .
       dockerfile: Dockerfile
     ports:
       - "8080:8080"
     environment:
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - DB_PATH=/app/data/ledger.db
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      ADMIN_API_KEY: ${ADMIN_API_KEY}
+      CLIENT_API_KEY_TIER1: ${CLIENT_API_KEY_TIER1:-sk-test-tier-1}
+      CLIENT_API_KEY_DEMO: ${CLIENT_API_KEY_DEMO:-sk-demo-live}
+      BACKENDS_CONFIG_PATH: configs/backends.cloud.yaml
+      LEDGER_DB_PATH: /app/data/ledger.db
     volumes:
+      # Keeps spend history across restarts. Without this the ledger — and
+      # every budget already consumed — resets whenever the container does.
       - ./data:/app/data
-    depends_on:
-      - local_vllm
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8080/health')\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
   dashboard:
     build:
@@ -23,14 +42,11 @@ services:
     ports:
       - "8501:8501"
     environment:
-      - DB_PATH=/app/data/ledger.db
-    volumes:
-      - ./data:/app/data
-
-  local_vllm:
-    # Simulating a local vLLM / llama.cpp backend
-    image: ghcr.io/ggerganov/llama.cpp:server
-    ports:
-      - "8000:8080"
-    command: -m /models/dummy.gguf --host 0.0.0.0 --port 8080
-    # In a real setup, this mounts your quantized models
+      # Service name, not localhost — inside the network the gateway is
+      # reachable by its Compose service name.
+      GATEWAY_URL: http://gateway:8080
+      ADMIN_API_KEY: ${ADMIN_API_KEY}
+      CLIENT_API_KEY_TIER1: ${CLIENT_API_KEY_TIER1:-sk-test-tier-1}
+    depends_on:
+      gateway:
+        condition: service_started

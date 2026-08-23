@@ -209,6 +209,27 @@ demonstrated.
 Keep `/admin/*` unreachable on a public instance — those endpoints hold
 operator authority.
 
+### Containers
+
+```bash
+docker compose up --build
+```
+
+Brings up the gateway on `:8080` and the dashboard on `:8501` against cloud
+backends, with the ledger on a mounted volume so spend history survives
+restarts. Needs `GROQ_API_KEY` in a `.env` beside the compose file.
+
+### Render
+
+`render.yaml` is a deployable blueprint: push to GitHub, then
+**New → Blueprint**. Set `GROQ_API_KEY`, `ADMIN_API_KEY` and
+`CLIENT_API_KEY_DEMO` in the dashboard — they are deliberately not in the file.
+
+Two free-tier caveats: instances sleep after ~15 minutes idle so the first
+request takes ~30s to wake, and the filesystem is ephemeral, so the SQLite
+ledger resets on each deploy. Both are fine for a demo and wrong for anything
+real.
+
 ---
 
 ## API
