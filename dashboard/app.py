@@ -304,7 +304,7 @@ with tab2:
                     budgets_df["masked_api_key"] = budgets_df["api_key"].apply(
                         lambda k: f"{k[:5]}...{k[-4:]}" if len(k) > 10 else k
                     )
-                st.dataframe(budgets_df, use_container_width=True)
+                st.dataframe(budgets_df, width="stretch")
             else:
                 st.info("No budgets configured.")
 
@@ -320,7 +320,7 @@ with tab2:
                     )
                 if "timestamp" in ledger_view.columns:
                     ledger_view = ledger_view.sort_values("timestamp", ascending=False)
-                st.dataframe(ledger_view, use_container_width=True, hide_index=True)
+                st.dataframe(ledger_view, width="stretch", hide_index=True)
             else:
                 st.info("No requests recorded yet.")
 
@@ -342,7 +342,7 @@ with tab2:
                 fb_df["approval_%"] = (fb_df["positive"] / fb_df["total"] * 100).round(
                     1
                 )
-                st.dataframe(fb_df, use_container_width=True, hide_index=True)
+                st.dataframe(fb_df, width="stretch", hide_index=True)
             else:
                 st.info(
                     "No ratings yet — use 👍/👎 in the Chat Sandbox. Until "
