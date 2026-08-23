@@ -1,10 +1,31 @@
-# LLM Gateway — Cost Control & Fallback Routing
+<div align="center">
 
-A control layer between your applications and LLM providers. One
-OpenAI-compatible endpoint that decides **which model** serves a request,
-**whether the caller can afford it**, and **what the model is allowed to see** —
-so cost, reliability, and data handling are enforced once, centrally, instead of
-being re-implemented in every application that calls an LLM.
+# LLM Gateway
+
+**Cost control, model routing, and failover for LLM traffic.**
+
+One OpenAI-compatible endpoint that decides *which model* serves a request,
+*whether the caller can afford it*, and *what the model is allowed to see*.
+
+[![CI](https://github.com/abntazim-1/LLM-Gateway-with-Cost-Control-Fallback-Routing/actions/workflows/ci.yml/badge.svg)](https://github.com/abntazim-1/LLM-Gateway-with-Cost-Control-Fallback-Routing/actions/workflows/ci.yml)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![Tests](https://img.shields.io/badge/tests-134%20passing-brightgreen.svg)](#quality)
+[![Evals](https://img.shields.io/badge/policy%20evals-61%2F61-brightgreen.svg)](#quality)
+[![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
+
+</div>
+
+---
+
+## The problem
+
+Every application that calls an LLM re-implements the same concerns: budget
+limits, retries when a provider fails, deciding which model is worth paying for,
+and keeping sensitive data out of a third party's logs. Implemented per app,
+these drift apart, and the failures are quiet — a runaway bill, an outage that
+surfaces as a broken feature, PII in someone else's telemetry.
+
+This gateway moves those decisions into one layer that every application shares.
 
 ```
                        ┌──────────────────────────┐
@@ -15,21 +36,21 @@ being re-implemented in every application that calls an LLM.
    ┌────────────────────────────────────────────────────────────────┐
    │                      FastAPI Data Plane                        │
    │                                                                │
-   │   Auth + rate limit  →  Guardrails  →  PII vault (mask)         │
-   │        →  Prompt cache  →  Budget reservation                   │
+   │   Auth + rate limit  →  Guardrails  →  PII vault (mask)        │
+   │        →  Prompt cache  →  Budget reservation                  │
    └────────────────────────────────┬───────────────────────────────┘
                                     ▼
                        ┌──────────────────────────┐
-                       │        Router            │
+                       │         Router           │
                        │  filter: health, context │
-                       │  window, capability      │
+                       │          capability      │
                        │  rank:   strategy        │
                        └────────────┬─────────────┘
                                     │  failover · retry · cascade
         ┌───────────────────────────┼───────────────────────────┐
         ▼                           ▼                           ▼
   ┌────────────┐            ┌──────────────┐            ┌──────────────┐
-  │  OpenAI    │            │  Anthropic   │            │ vLLM/Ollama  │
+  │   OpenAI   │            │  Anthropic   │            │ vLLM/Ollama  │
   └────────────┘            └──────────────┘            └──────────────┘
         └───────────────────────────┼───────────────────────────┘
                                     ▼
@@ -39,117 +60,117 @@ being re-implemented in every application that calls an LLM.
 
 ---
 
-## What it does
+## Routing in action
 
-**Cost control.** Every request is priced before it runs and reconciled against
-real provider usage afterwards. Per-client daily and monthly budgets are checked
-and reserved atomically, so concurrent requests cannot collectively overshoot a
-limit. Spend is recorded per request, per backend, in a SQLite ledger.
+Same endpoint, no model specified, `complexity` strategy — the router picks
+based on what the request actually needs:
 
-**Model routing.** Six strategies decide which backend serves a request:
+```bash
+curl -sD- localhost:8080/v1/chat/completions -H "Authorization: Bearer $KEY" -d '{"messages":[{"role":"user","content":"hi there"}]}' | grep -i x-backend-model
+```
+```
+x-backend-model: qwen2.5:0.5b        ← $0.00005 / 1k
+```
 
-| Strategy | Selects |
-|---|---|
-| `cost_first` | Cheapest healthy backend |
-| `latency_first` | Fastest by rolling average, probing unmeasured backends first |
-| `complexity` | Scores the prompt; escalates only when it looks like it needs it |
-| `cascade` | Answers cheaply, then escalates **only if the answer was inadequate** |
-| `round_robin` / `weighted_round_robin` | Even distribution |
+```bash
+curl -sD- localhost:8080/v1/chat/completions -H "Authorization: Bearer $KEY" -d '{"messages":[{"role":"user","content":"Why would a two-tier cache produce stale reads under concurrent writes?"}]}' | grep -i x-backend-model
+```
+```
+x-backend-model: phi3:latest         ← $0.00040 / 1k
+```
 
-Callers may pin a specific model, which overrides routing entirely.
-
-**Reliability.** A per-backend circuit breaker (closed → open → half-open) stops
-sending traffic to failing providers. Requests fail over to the next ranked
-backend automatically, and responses carry `X-Backend-Fallback` so a silent
-model substitution is observable rather than invisible.
-
-**Data handling.** PII is replaced with indexed placeholders (`[EMAIL_1]`)
-before the prompt reaches a provider, and restored on the way back — so the
-model never sees the real values but the caller still gets them. Prompts are
-screened for common injection patterns; completions are screened for leaked
-credentials.
-
-**Observability.** Prometheus metrics, OpenTelemetry spans, a request ledger,
-and a Streamlit dashboard for spend, latency, cache hit rate, backend health,
-and answer-quality ratings.
+A trivial prompt costs **8× less** without the caller doing anything. Every
+response carries `X-Backend-Id` and `X-Backend-Model`, so which model answered
+is never a mystery — and `X-Backend-Fallback` appears when failover substituted
+a different one.
 
 ---
 
-## Scope and limitations
+## Capabilities
 
-This is a portfolio project, not a production deployment. Its behaviour has been
-measured rather than assumed — including what does **not** work:
+### Cost control
+Requests are priced before they run and reconciled against real provider usage
+afterwards. Daily and monthly budgets are checked and reserved **atomically**,
+so concurrent requests cannot collectively overshoot a limit. Every request is
+recorded per client and per backend in a SQLite ledger.
 
-| Area | Measured behaviour |
+### Model routing
+| Strategy | Selects |
 |---|---|
-| Token accounting | Per-backend tokenizers; estimates within ~3% of real usage. Streaming bills provider-reported usage where available. |
-| Injection screening | Blocks common **English** patterns, including obfuscated forms (zero-width characters, homoglyphs, leetspeak). **Non-English prompts are not screened.** |
-| PII masking | Detects structured identifiers — emails, SSNs, cards (Luhn-validated), IBANs, IPs, dates of birth, passports, API credentials. **Does not detect names, street addresses, or medical conditions**, which need NER rather than pattern matching. |
-| Answer adequacy (`cascade`) | Detects refusals, truncation, and non-answers. **Does not detect fluent but incorrect answers.** |
+| `cost_first` | Cheapest healthy backend |
+| `latency_first` | Fastest by rolling average; unmeasured backends are probed first rather than starved |
+| `complexity` | Scores the prompt and escalates only when it warrants it |
+| `cascade` | Answers cheaply, then escalates **only if the answer was inadequate** |
+| `round_robin` · `weighted_round_robin` | Even distribution |
 
-Those gaps are not footnotes — they are encoded as `known_gap` cases in
-`evals/datasets/`, counted on every CI run, with a test that fails if one is
-silently closed without being recorded.
+Candidates are filtered before ranking: unhealthy backends, backends whose
+context window cannot fit the request, and backends lacking a required
+capability are excluded. Callers may pin a specific model, overriding routing.
+
+### Reliability
+A per-backend circuit breaker (`closed → open → half-open`) stops sending
+traffic to failing providers, and requests fail over to the next ranked backend
+automatically. Verified under test: with the primary backend deliberately
+broken, **every client request still returned 200**, and once the breaker
+opened, subsequent requests skipped the dead backend in under 0.5 s.
+
+### Data handling
+PII is replaced with indexed placeholders (`[EMAIL_1]`) before the prompt
+reaches a provider and restored on the way back — the model never sees real
+values, the caller never sees placeholders. Prompts are screened for injection
+patterns including obfuscated forms; completions are screened for leaked
+credentials.
+
+### Observability
+Prometheus metrics, OpenTelemetry spans, a queryable request ledger, and a
+Streamlit operator dashboard covering spend, latency, cache hit rate, backend
+health, and answer-quality ratings.
 
 ---
 
 ## Quickstart
 
-Requires Python 3.10+. The example configuration runs entirely on local models
-via [Ollama](https://ollama.com), so no provider API keys are needed to try it.
-
-**1. Install**
+Requires **Python 3.10+**. The default configuration runs entirely on local
+models via [Ollama](https://ollama.com) — no provider API keys needed to try it.
 
 ```bash
-python -m venv venv && source venv/Scripts/activate  # Windows
+python -m venv venv && source venv/bin/activate    # Windows: venv\Scripts\activate
 ```
-
 ```bash
 pip install -e ".[dev]"
 ```
-
-**2. Pull the local models used by the example config**
-
 ```bash
 ollama pull qwen2.5:0.5b && ollama pull phi3
 ```
-
-**3. Configure**
-
 ```bash
 cp .env.example .env
 ```
 
-Set `ADMIN_API_KEY` and at least one client key in `.env`. Provider keys
-(`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`) are only needed if you enable those
-backends in `configs/backends.yaml`.
+Set `ADMIN_API_KEY` and at least one client key in `.env`. Provider keys are
+only needed if you enable those backends in `configs/backends.yaml`.
 
-**4. Run the gateway**
-
+**Run the gateway:**
 ```bash
 uvicorn gateway.main:app --port 8080
 ```
 
-**5. Run the dashboard** (optional, separate terminal)
-
+**Run the dashboard** (optional, separate terminal):
 ```bash
 streamlit run dashboard/app.py
 ```
 
-Interactive API docs are at `http://localhost:8080/docs`, the dashboard at
-`http://localhost:8501`.
+| | |
+|---|---|
+| Interactive API docs | http://localhost:8080/docs |
+| Operator dashboard | http://localhost:8501 |
 
-> A `Makefile` provides `make run` / `make dashboard` / `make test` shortcuts on
-> platforms where `make` is available.
-
-**6. Send a request**
-
+**Send a request:**
 ```bash
 curl -X POST http://localhost:8080/v1/chat/completions -H "Authorization: Bearer $CLIENT_API_KEY_TIER1" -H "Content-Type: application/json" -d '{"messages":[{"role":"user","content":"Hello!"}]}'
 ```
 
-Omitting `model` lets the router choose. The response carries `X-Backend-Id`
-and `X-Backend-Model` showing which backend actually served it.
+> Omit `model` to let the router choose. A `Makefile` provides
+> `make run` / `make dashboard` / `make test` where `make` is available.
 
 ---
 
@@ -159,21 +180,19 @@ and `X-Backend-Model` showing which backend actually served it.
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /v1/chat/completions` | OpenAI-compatible completion, streaming or not |
+| `POST /v1/chat/completions` | OpenAI-compatible completion, streaming or buffered |
 | `POST /v1/feedback` | Rate a completed request (`+1` / `-1`) |
 
-**Operations**
+**Operations** — require the `X-Admin-Token` header
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /health` · `GET /health/backends` | Liveness; per-backend health, circuit state, pricing |
+| `GET /health` · `/health/backends` | Liveness; per-backend health, circuit state, pricing |
 | `GET /metrics` | Prometheus metrics |
 | `GET /admin/requests` · `/admin/budgets` · `/admin/feedback` | Ledger, budgets, quality ratings |
 | `PATCH /admin/budgets/{api_key}` | Create or update a client's limits |
 | `POST /admin/circuit-breakers/{id}/reset` | Force a breaker closed |
 | `POST /admin/reload-config` | Hot-reload YAML config without restarting |
-
-Admin endpoints require the `X-Admin-Token` header.
 
 ---
 
@@ -181,36 +200,54 @@ Admin endpoints require the `X-Admin-Token` header.
 
 | File | Controls |
 |---|---|
-| `configs/backends.yaml` | Backends: endpoint, pricing, `capability_tier`, `context_length`, tokenizer |
-| `configs/routing_policy.yaml` | Active routing strategy and thresholds |
-| `configs/budgets.yaml` | Per-client spend limits and rate limits |
+| `configs/backends.yaml` | Endpoint, pricing, `capability_tier`, `context_length`, tokenizer |
+| `configs/routing_policy.yaml` | Active strategy and thresholds |
+| `configs/budgets.yaml` | Per-client spend and rate limits |
 | `configs/circuit_breaker.yaml` | Failure threshold, cooldown, request timeout |
 
-`capability_tier` is declared separately from price on purpose. Routing that
-wants "the better model" ranks on capability, not cost — the two usually
-correlate, but when they diverge, ranking by price selects the *weaker* model.
+`capability_tier` is declared **separately from price** deliberately. Routing
+that means "use the better model" ranks on capability, not cost. The two usually
+correlate — but when they diverge, ranking by price selects the *weaker* model,
+which is the opposite of the intent.
 
 ---
 
-## Testing
+## Quality
 
 ```bash
-pytest
+pytest                      # 134 tests
+python evals/run_evals.py   # 61 policy eval cases
 ```
 
-134 tests covering routing, budget enforcement, rate limiting, circuit breaking,
+Tests cover routing, budget enforcement, rate limiting, circuit breaking,
 failover, PII masking, guardrails, token accounting, streaming cost
 reconciliation, and context-window enforcement.
 
-```bash
-python evals/run_evals.py
-```
-
-Scores routing, screening, PII, and answer-adequacy policy against labelled
-datasets in `evals/datasets/`. Deterministic, no model calls, runs in CI.
-Reports pass rate and tracked known gaps; exits non-zero on regression.
+The **eval harness** is separate from the test suite and answers a different
+question. Unit tests pin individual behaviours; the evals score each policy
+against labelled datasets so it is possible to tell whether routing, screening
+and escalation are getting *better or worse overall*. They are deterministic,
+need no model calls, and gate CI.
 
 Both run on every push via GitHub Actions.
+
+---
+
+## Scope and limitations
+
+This is a portfolio project, not a production deployment. Its behaviour has been
+**measured rather than assumed** — including what does not work:
+
+| Area | Measured behaviour |
+|---|---|
+| **Token accounting** | Per-backend tokenizers, within ~3% of real usage (was 67–97% off using a character heuristic). Streaming bills provider-reported usage where available. |
+| **Injection screening** | Blocks common **English** patterns including obfuscated forms — zero-width characters, homoglyphs, leetspeak, separator padding. ⚠️ **Non-English prompts are not screened.** |
+| **PII masking** | Detects structured identifiers: emails, SSNs, cards (Luhn-validated), IBANs, IPs, dates of birth, passports, API credentials. ⚠️ **Does not detect names, addresses, or medical conditions** — these need NER, not pattern matching. |
+| **Answer adequacy** (`cascade`) | Detects refusals, truncation and non-answers. ⚠️ **Does not detect fluent but incorrect answers.** |
+
+These gaps are not disclaimers in prose — each is encoded as a `known_gap` case
+in `evals/datasets/`, counted on every CI run, with a test that **fails if one
+is silently closed** without being recorded. Currently 8 are tracked.
 
 ---
 
@@ -218,17 +255,20 @@ Both run on every push via GitHub Actions.
 
 ```
 gateway/
-  main.py            FastAPI app, request pipeline
-  adapters/          Per-provider clients, tokenization, parameter translation
-  policy/            Router, budgets, circuit breaker, cache, guardrails, PII
-  ledger/            SQLite spend store and async write queue
-  telemetry/         Prometheus metrics, OpenTelemetry tracing
-dashboard/           Streamlit operator UI
-evals/               Policy evaluation harness and labelled datasets
+  main.py          FastAPI app and request pipeline
+  adapters/        Provider clients, tokenization, parameter translation
+  policy/          Router, budgets, circuit breaker, cache, guardrails, PII
+  ledger/          SQLite spend store and async write queue
+  telemetry/       Prometheus metrics, OpenTelemetry tracing
+dashboard/         Streamlit operator UI
+evals/             Policy evaluation harness and labelled datasets
+tests/             Test suite
 ```
 
 ---
 
-## License
+<div align="center">
 
-MIT — see [LICENSE](LICENSE).
+MIT licensed — see [LICENSE](LICENSE)
+
+</div>
