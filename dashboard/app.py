@@ -415,10 +415,15 @@ with tab3:
                     cheapest_badge = " 💰 Cheapest" if backend_id == cheapest_id else ""
                     prompt_cost = status.get("cost_per_1k_prompt")
                     completion_cost = status.get("cost_per_1k_completion")
+                    # Quoted per 1M tokens, the convention providers publish
+                    # prices in. Per 1k at 4 decimal places rounded a $0.00005
+                    # rate and a $0.00010 rate to the same "$0.0001", showing
+                    # two backends as identically priced when one is twice the
+                    # other.
                     cost_line = (
-                        f"<p>Cost: <strong>${prompt_cost:.4f}</strong> / 1k prompt "
-                        f"tokens, <strong>${completion_cost:.4f}</strong> / 1k "
-                        f"completion tokens{cheapest_badge}</p>"
+                        f"<p>Cost: <strong>${prompt_cost * 1000:,.2f}</strong> / 1M "
+                        f"prompt tokens, <strong>${completion_cost * 1000:,.2f}</strong>"
+                        f" / 1M completion tokens{cheapest_badge}</p>"
                         if prompt_cost is not None
                         else ""
                     )
