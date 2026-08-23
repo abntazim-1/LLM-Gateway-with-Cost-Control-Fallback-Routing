@@ -78,10 +78,7 @@ and answer-quality ratings.
 ## Scope and limitations
 
 This is a portfolio project, not a production deployment. Its behaviour has been
-measured rather than assumed, and the measurements — including what does **not**
-work — are recorded in **[docs/AI_ML_FLAWS.md](docs/AI_ML_FLAWS.md)**.
-
-Summary of where the current implementation stands:
+measured rather than assumed — including what does **not** work:
 
 | Area | Measured behaviour |
 |---|---|
@@ -90,9 +87,9 @@ Summary of where the current implementation stands:
 | PII masking | Detects structured identifiers — emails, SSNs, cards (Luhn-validated), IBANs, IPs, dates of birth, passports, API credentials. **Does not detect names, street addresses, or medical conditions**, which need NER rather than pattern matching. |
 | Answer adequacy (`cascade`) | Detects refusals, truncation, and non-answers. **Does not detect fluent but incorrect answers.** |
 
-Those gaps are not footnotes — they are encoded as `known_gap` cases in the
-evaluation suite, counted on every CI run, with a test that fails if one is
-silently closed without updating the documentation.
+Those gaps are not footnotes — they are encoded as `known_gap` cases in
+`evals/datasets/`, counted on every CI run, with a test that fails if one is
+silently closed without being recorded.
 
 ---
 
@@ -228,7 +225,6 @@ gateway/
   telemetry/         Prometheus metrics, OpenTelemetry tracing
 dashboard/           Streamlit operator UI
 evals/               Policy evaluation harness and labelled datasets
-docs/                Flaw audit and measurement probes
 ```
 
 ---
