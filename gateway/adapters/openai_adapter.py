@@ -20,14 +20,23 @@ class OpenAIAdapter(BaseAdapter):
         self.api_key = os.environ.get("OPENAI_API_KEY")
         self.key_pool = ProviderKeyPool()
 
-        # Load keys from config list or env var
-        cfg_keys = config.get("api_keys", [])
-        if isinstance(cfg_keys, list):
+        # A backend's own `api_keys` are authoritative. OPENAI_API_KEY is a
+        # fallback for backends that declare none — never an addition.
+        #
+        # Previously both were pooled together, so a backend configured with
+        # its own credential (an OpenAI-compatible provider such as Groq)
+        # round-robined between that key and the global OpenAI one, sending
+        # roughly half its traffic upstream with a credential for a different
+        # vendor. Requests failed intermittently and the backend looked
+        # flaky rather than misconfigured.
+        cfg_keys = [k for k in (config.get("api_keys") or []) if k]
+        if cfg_keys:
             for k in cfg_keys:
                 self.key_pool.add_key(k)
-        if self.api_key:
+        elif self.api_key:
             for k in self.api_key.split(","):
-                self.key_pool.add_key(k)
+                if k.strip():
+                    self.key_pool.add_key(k.strip())
 
     def _get_active_key(self) -> str:
         key = self.key_pool.get_next_key()
@@ -132,12 +141,25 @@ class OpenAIAdapter(BaseAdapter):
             raise AdapterException(f"OpenAI stream request failed: {str(e)}")
 
     async def health_check(self) -> bool:
-        if not self.api_key:
+        """Probe the backend with the same credential a real request uses.
+
+        This previously read `self.api_key`, which is populated only from the
+        OPENAI_API_KEY environment variable, while completions authenticate
+        from the key pool. Any backend whose key comes from its own
+        `api_keys` config — an OpenAI-compatible provider such as Groq, for
+        instance — therefore probed with the wrong credential (or none) and
+        reported unhealthy forever, even while serving requests perfectly.
+        The health loop would then trip its circuit breaker and route traffic
+        away from a working backend.
+        """
+        try:
+            key = self._get_active_key()
+        except AdapterException:
             return False
         try:
             response = await self.client.get(
                 f"{self.endpoint}/models",
-                headers={"Authorization": f"Bearer {self.api_key}"},
+                headers={"Authorization": f"Bearer {key}"},
                 timeout=5.0,
             )
             return response.status_code == 200

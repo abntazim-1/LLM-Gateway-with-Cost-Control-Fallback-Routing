@@ -105,9 +105,81 @@ def test_cloud_config_prices_capability_above_the_cheap_tier():
     ), f"{cheapest['id']} is cheapest but is not the lowest tier"
 
 
-def test_cloud_config_spans_more_than_one_vendor():
-    """Cross-vendor failover is the capability an in-house router cannot
-    provide; a cloud config pinned to one vendor gives that up."""
-    endpoints = {b["endpoint"].split("/")[2] for b in _cloud_backends()}
+def test_cloud_config_has_something_to_route_between():
+    """At least two distinct capability tiers must be active.
 
-    assert len(endpoints) > 1, f"only one vendor configured: {endpoints}"
+    A single-tier config makes every routing strategy degenerate — there is
+    nothing to escalate to, so cost_first, complexity and cascade all collapse
+    to the same backend. Cross-vendor failover is stronger still but needs a
+    second provider's credential, so it ships commented out rather than
+    breaking a setup that only has one key.
+    """
+    tiers = {b["capability_tier"] for b in _cloud_backends()}
+
+    assert len(tiers) > 1, f"only one capability tier active: {tiers}"
+
+
+# ── Credential isolation ─────────────────────────────────────────────────
+
+
+def _openai_adapter(**overrides):
+    from gateway.adapters.openai_adapter import OpenAIAdapter
+
+    cfg = {
+        "id": "b",
+        "model": "m",
+        "endpoint": "https://api.example.com/v1",
+        "cost_per_1k_prompt": 0.0,
+        "cost_per_1k_completion": 0.0,
+    }
+    cfg.update(overrides)
+    return OpenAIAdapter(cfg)
+
+
+def test_backend_keys_are_not_mixed_with_the_global_openai_key(monkeypatch):
+    """A backend's own credential must be the only one it uses.
+
+    Both were previously pooled together, so a backend configured for an
+    OpenAI-compatible provider round-robined between its own key and the
+    global OpenAI one — sending roughly half its traffic upstream with a
+    credential for a different vendor. Requests failed intermittently and the
+    backend looked flaky rather than misconfigured.
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-global-should-not-be-used")
+    adapter = _openai_adapter(api_keys=["gsk-backend-own-key"])
+
+    used = {adapter._get_active_key() for _ in range(8)}
+
+    assert used == {"gsk-backend-own-key"}, f"leaked global key: {used}"
+
+
+def test_falls_back_to_the_env_key_when_backend_declares_none(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-from-environment")
+
+    assert _openai_adapter()._get_active_key() == "sk-from-environment"
+
+
+def test_health_check_probes_with_the_key_requests_will_use(monkeypatch):
+    """Health checks previously read the env var directly while completions
+    authenticated from the pool, so a backend using its own credential
+    reported unhealthy forever while serving traffic perfectly — and the
+    health loop then tripped its breaker and routed around a working
+    backend."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-global")
+    adapter = _openai_adapter(api_keys=["gsk-backend-own-key"])
+
+    seen = {}
+
+    class _Resp:
+        status_code = 200
+
+    async def _fake_get(url, headers=None, timeout=None):
+        seen["auth"] = headers["Authorization"]
+        return _Resp()
+
+    monkeypatch.setattr(adapter.client, "get", _fake_get)
+
+    import asyncio
+
+    assert asyncio.run(adapter.health_check()) is True
+    assert seen["auth"] == "Bearer gsk-backend-own-key"

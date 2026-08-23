@@ -12,71 +12,94 @@
 # Groq, Together, Fireworks, OpenRouter and vLLM all serve that protocol, so
 # they use the same adapter with a different `endpoint`.
 #
-# Two calibration values must be re-derived per model rather than copied:
-#
-#   token_overhead_per_message  measured, not guessed — run
-#                               `python docs/probes/probe_tokens.py`. A wrong
-#                               value skews every budget estimate.
-#   capability_tier             higher = more capable. Routing that means
-#                               "use the better model" ranks on this, NOT on
-#                               price. Set it backwards and escalation routes
-#                               to the weaker model.
-#
-# Prices are per 1k tokens and must match the provider's published rates —
-# every budget decision derives from them. Verify before deploying; provider
-# pricing changes.
+# The two active backends below need only GROQ_API_KEY and run on Groq's free
+# tier, so a public demo costs nothing and visitors need no key of their own.
 
 backends:
   # ── Cheap tier ────────────────────────────────────────────────────────
-  # Groq's free tier is generous and fast, which makes it a good default for
-  # a public demo: visitors need no API key of their own, and the cost of
-  # someone hammering the endpoint is zero.
-  - id: groq-llama-3.1-8b
+  - id: groq-gpt-oss-20b
     provider: openai
-    model: llama-3.1-8b-instant
+    model: openai/gpt-oss-20b
     endpoint: "https://api.groq.com/openai/v1"
     api_keys: ["${GROQ_API_KEY}"]
-    cost_per_1k_prompt: 0.00005
-    cost_per_1k_completion: 0.00008
+    # VERIFY against https://groq.com/pricing before relying on these for
+    # real budgeting — every budget decision derives from them.
+    cost_per_1k_prompt: 0.00010
+    cost_per_1k_completion: 0.00050
     tokenizer: cl100k_base
-    token_overhead_per_message: 4
+    # Measured, not guessed: `python docs/probes/probe_tokens.py`. These
+    # models carry a ~68-token system template, so the default of 4 would
+    # under-estimate a short prompt by more than 90%.
+    token_overhead_per_message: 68
     capability_tier: 1
     capabilities:
       - json_mode
     context_length: 131072
 
   # ── Premium tier ──────────────────────────────────────────────────────
-  # Only reached when the router judges a request needs it, so the expensive
-  # per-token rate applies to a small share of traffic. Comment this block
-  # out to run the demo entirely on the free tier.
-  - id: openai-gpt-4o-mini
+  # Same family, 6x the parameters. Only reached when the router judges a
+  # request needs it, so the higher rate applies to a small share of traffic.
+  - id: groq-gpt-oss-120b
     provider: openai
-    model: gpt-4o-mini
-    endpoint: "https://api.openai.com/v1"
-    api_keys: ["${OPENAI_API_KEY}"]
+    model: openai/gpt-oss-120b
+    endpoint: "https://api.groq.com/openai/v1"
+    api_keys: ["${GROQ_API_KEY}"]
     cost_per_1k_prompt: 0.00015
-    cost_per_1k_completion: 0.00060
+    cost_per_1k_completion: 0.00075
     tokenizer: cl100k_base
-    token_overhead_per_message: 4
+    token_overhead_per_message: 68
     capability_tier: 2
     capabilities:
       - json_mode
-    context_length: 128000
+    context_length: 131072
 
-  # ── Cross-vendor failover ─────────────────────────────────────────────
-  # A different vendor entirely, so an OpenAI outage does not take the
-  # gateway down with it. This is the thing an in-house router cannot do for
-  # you: OpenAI will never fail your traffic over to Anthropic.
-  - id: anthropic-claude-haiku
-    provider: anthropic
-    model: claude-3-5-haiku-20241022
-    endpoint: "https://api.anthropic.com/v1"
-    api_keys: ["${ANTHROPIC_API_KEY}"]
-    cost_per_1k_prompt: 0.00080
-    cost_per_1k_completion: 0.00400
-    tokenizer: cl100k_base
-    token_overhead_per_message: 4
-    capability_tier: 2
-    capabilities:
-      - json_mode
-    context_length: 200000
+  # ── Cross-vendor failover (optional) ──────────────────────────────────
+  # Uncomment with a real key to survive a Groq outage. This is the thing an
+  # in-house router cannot do for you: OpenAI will never fail your traffic
+  # over to Anthropic. Recalibrate token_overhead_per_message per model.
+  #
+  # - id: openai-gpt-4o-mini
+  #   provider: openai
+  #   model: gpt-4o-mini
+  #   endpoint: "https://api.openai.com/v1"
+  #   api_keys: ["${OPENAI_API_KEY}"]
+  #   cost_per_1k_prompt: 0.00015
+  #   cost_per_1k_completion: 0.00060
+  #   tokenizer: cl100k_base
+  #   token_overhead_per_message: 4
+  #   capability_tier: 2
+  #   capabilities: [json_mode]
+  #   context_length: 128000
+  #
+  # - id: anthropic-claude-haiku
+  #   provider: anthropic
+  #   model: claude-3-5-haiku-20241022
+  #   endpoint: "https://api.anthropic.com/v1"
+  #   api_keys: ["${ANTHROPIC_API_KEY}"]
+  #   cost_per_1k_prompt: 0.00080
+  #   cost_per_1k_completion: 0.00400
+  #   tokenizer: cl100k_base
+  #   token_overhead_per_message: 4
+  #   capability_tier: 2
+  #   capabilities: [json_mode]
+  #   context_length: 200000
+
+# ── Note on reasoning models ──────────────────────────────────────────
+# gpt-oss emits internal reasoning tokens. They are billed as completion
+# tokens and consume max_tokens *before* any visible content is produced, so
+# too small a budget returns an empty string with finish_reason=length.
+#
+# Measured on gpt-oss-120b with a genuinely analytical prompt:
+#
+#     max_tokens=250  ->  0 characters of content   (all reasoning)
+#     max_tokens=400  ->  73 characters
+#     max_tokens=600  ->  1538 characters
+#
+# Budget at least 400, preferably 600+, when these models are in play.
+# max_tokens is a ceiling rather than a target — a model that finishes early
+# simply stops, and the pre-flight reservation is reconciled against real
+# usage afterwards, so a generous ceiling costs headroom rather than money.
+#
+# The cascade strategy handles the truncated case correctly on its own: an
+# empty reply with finish_reason=length is treated as inadequate and escalated
+# rather than returned to the caller.

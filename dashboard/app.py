@@ -104,10 +104,17 @@ with tab1:
             "Max Tokens",
             min_value=1,
             max_value=4096,
-            value=256,
-            step=32,
-            help="Caps generation length so local/slow backends can't run "
-            "past the client's own request timeout below.",
+            # Reasoning models spend this budget on internal reasoning before
+            # emitting any visible content — gpt-oss-120b returns an empty
+            # string at 250 and only becomes useful past ~400. A ceiling is
+            # not a target: a model that finishes early stops, and the budget
+            # reservation is reconciled against real usage, so headroom here
+            # costs nothing on models that don't need it.
+            value=600,
+            step=50,
+            help="Ceiling on generation length. Reasoning models consume this "
+            "on internal reasoning before producing visible output, so too "
+            "low a value returns an empty reply.",
         )
     with col4:
         history_limit = st.number_input(
