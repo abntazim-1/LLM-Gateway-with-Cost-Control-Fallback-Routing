@@ -1,5 +1,6 @@
 import json
 import os
+import secrets
 
 import httpx
 import pandas as pd
@@ -442,8 +443,32 @@ with tab3:
 
         with col_admin1:
             st.subheader("Modify Client Budget / Rate Limits")
+
+            if confirmation := st.session_state.pop("budget_update_msg", None):
+                st.success(confirmation)
+
+            # There is no signup flow — a client key is whatever string an
+            # operator submits here, so unguessability is entirely on whoever
+            # types it. Generating one in-place avoids the alternative of
+            # inventing a key by hand or shelling out to another terminal.
+            # Lives outside the form because Streamlit forms only permit a
+            # submit button.
+            if st.button("🔑 Generate key", help="Create a random client key"):
+                st.session_state.new_client_key = f"sk-{secrets.token_hex(24)}"
+                st.rerun()
+
+            if st.session_state.get("new_client_key"):
+                st.caption(
+                    "Copy this now and send it to the client — set the limits "
+                    "below, then submit to activate it."
+                )
+                st.code(st.session_state.new_client_key, language=None)
+
             with st.form("budget_update_form"):
-                target_key = st.text_input("Target client API Key (or new key)")
+                target_key = st.text_input(
+                    "Target client API Key (or new key)",
+                    value=st.session_state.get("new_client_key", ""),
+                )
                 daily_limit = st.number_input(
                     "Daily Cost Limit (USD)", min_value=0.0, value=10.0, step=1.0
                 )
@@ -471,9 +496,14 @@ with tab3:
                             timeout=5.0,
                         )
                         if update_resp.status_code == 200:
-                            st.success(
-                                f"Successfully configured credentials for key: {target_key}"
+                            # Carried through the rerun rather than shown
+                            # here: st.success followed immediately by
+                            # st.rerun paints and then discards the message,
+                            # so the operator never sees the confirmation.
+                            st.session_state.budget_update_msg = (
+                                f"Activated key: {target_key}"
                             )
+                            st.session_state.pop("new_client_key", None)
                             st.rerun()
                         else:
                             st.error(f"Failed to update: {update_resp.text}")
