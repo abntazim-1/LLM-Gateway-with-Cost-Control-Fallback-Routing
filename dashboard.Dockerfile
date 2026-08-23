@@ -25,9 +25,6 @@ ENV PORT=8501
 EXPOSE 8501
 
 # headless suppresses the browser-opening and telemetry prompts, which
-# otherwise block startup in a container. Shell form so $PORT expands.
-CMD streamlit run dashboard/app.py \
-    --server.port=${PORT} \
-    --server.address=0.0.0.0 \
-    --server.headless=true \
-    --browser.gatherUsageStats=false
+# otherwise block startup in a container. `exec` so Streamlit becomes PID 1
+# and receives SIGTERM directly, rather than the shell swallowing it.
+CMD ["sh", "-c", "exec streamlit run dashboard/app.py --server.port=${PORT} --server.address=0.0.0.0 --server.headless=true --browser.gatherUsageStats=false"]

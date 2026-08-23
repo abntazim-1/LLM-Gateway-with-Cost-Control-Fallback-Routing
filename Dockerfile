@@ -33,5 +33,8 @@ RUN mkdir -p /app/data
 ENV PORT=8080
 EXPOSE 8080
 
-# Shell form so $PORT expands at runtime rather than being passed literally.
-CMD uvicorn gateway.main:app --host 0.0.0.0 --port ${PORT}
+# `sh -c` to expand $PORT, `exec` so uvicorn replaces the shell and becomes
+# PID 1. Without exec the shell holds PID 1 and does not forward SIGTERM, so
+# shutdown never runs — and this app flushes its async ledger queue there.
+# Queued spend records would be lost on every restart or redeploy.
+CMD ["sh", "-c", "exec uvicorn gateway.main:app --host 0.0.0.0 --port ${PORT}"]
