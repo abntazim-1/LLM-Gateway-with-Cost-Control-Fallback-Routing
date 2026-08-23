@@ -25,7 +25,11 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
-docs/
+
+# docs/ is published — the flaw audit and probe scripts are part of the
+# project's record. Only the scratch generator is excluded.
+docs/_write_audit.md
+
 # Environment & secrets
 .env
 .env.*
