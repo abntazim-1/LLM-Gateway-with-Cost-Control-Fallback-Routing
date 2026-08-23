@@ -174,6 +174,43 @@ curl -X POST http://localhost:8080/v1/chat/completions -H "Authorization: Bearer
 
 ---
 
+## Deploying
+
+Swapping local models for cloud providers is a **config change, not a code
+change**. The router, every strategy, budgets, guardrails, PII masking and the
+circuit breakers operate on adapters, not on any particular vendor.
+
+```bash
+BACKENDS_CONFIG_PATH=configs/backends.cloud.yaml
+```
+
+That config ships ready to use: Groq's free tier as the cheap default, GPT-4o
+mini as the premium tier, and Claude Haiku as a **different-vendor** failover —
+so one provider's outage doesn't take the gateway down with it. Note that
+`provider: openai` means "speaks the OpenAI wire protocol", not "is OpenAI":
+Groq, Together, Fireworks, OpenRouter and vLLM all use that adapter with a
+different `endpoint`.
+
+Two values must be re-derived per model rather than copied:
+
+- **`token_overhead_per_message`** — measured, not guessed. Run
+  `python docs/probes/probe_tokens.py`; a wrong value skews every budget
+  estimate.
+- **`capability_tier`** — higher is more capable. Escalation ranks on this,
+  *not* on price. Set it backwards and "use the better model" routes to the
+  weaker one.
+
+**For a public demo**, run the free tier and issue one capped key rather than
+asking visitors for their own — nobody pastes a live API key into a stranger's
+gateway. A `$0.25/day, 10 req/min` key is safe to publish, because the budget
+and rate limiting that bound the blast radius are the features being
+demonstrated.
+
+Keep `/admin/*` unreachable on a public instance — those endpoints hold
+operator authority.
+
+---
+
 ## API
 
 **Inference**

@@ -18,7 +18,11 @@ class ConfigManager:
         self.config_dir = config_dir
 
     def load_backends(self) -> List[BaseAdapter]:
-        backends_path = os.path.join(self.config_dir, "backends.yaml")
+        # Honours the same override as startup, so a hot reload cannot swap a
+        # deployment back onto the repository's default backends.
+        backends_path = os.environ.get(
+            "BACKENDS_CONFIG_PATH", os.path.join(self.config_dir, "backends.yaml")
+        )
         if not os.path.exists(backends_path):
             logger.warning(f"Backends config file missing at {backends_path}")
             return []

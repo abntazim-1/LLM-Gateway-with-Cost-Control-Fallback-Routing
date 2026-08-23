@@ -31,6 +31,9 @@ docs/
 # Environment & secrets
 .env
 .env.*
+# ...but the template must ship, or a fresh clone has no way to know which
+# variables the gateway expects. It contains placeholders only.
+!.env.example
 .venv
 env/
 venv/

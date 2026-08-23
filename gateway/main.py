@@ -258,9 +258,13 @@ async def lifespan(app: FastAPI):
         cooldown_sec=cb_config.get("cooldown_period_sec", 30),
     )
 
-    # Init adapters
-    backends_config_path = os.path.join(
-        os.path.dirname(__file__), "..", "configs", "backends.yaml"
+    # Init adapters. BACKENDS_CONFIG_PATH lets a deployment point at a
+    # different backend set — cloud providers instead of local models — without
+    # editing the file the repository ships, matching how BUDGETS_CONFIG_PATH
+    # already works.
+    backends_config_path = os.environ.get(
+        "BACKENDS_CONFIG_PATH",
+        os.path.join(os.path.dirname(__file__), "..", "configs", "backends.yaml"),
     )
     backends = load_config(backends_config_path).get("backends", [])
     adapters: List[BaseAdapter] = []

@@ -1,0 +1,82 @@
+# Cloud backend configuration — for a deployed instance.
+#
+# Activate by pointing the gateway at this file instead of backends.yaml:
+#
+#     BACKENDS_CONFIG_PATH=configs/backends.cloud.yaml
+#
+# Nothing else changes. The router, every routing strategy, budgets,
+# guardrails, PII masking, circuit breakers and the eval suite are
+# provider-agnostic — they operate on adapters, not on any particular vendor.
+#
+# `provider: openai` means "speaks the OpenAI wire protocol", not "is OpenAI".
+# Groq, Together, Fireworks, OpenRouter and vLLM all serve that protocol, so
+# they use the same adapter with a different `endpoint`.
+#
+# Two calibration values must be re-derived per model rather than copied:
+#
+#   token_overhead_per_message  measured, not guessed — run
+#                               `python docs/probes/probe_tokens.py`. A wrong
+#                               value skews every budget estimate.
+#   capability_tier             higher = more capable. Routing that means
+#                               "use the better model" ranks on this, NOT on
+#                               price. Set it backwards and escalation routes
+#                               to the weaker model.
+#
+# Prices are per 1k tokens and must match the provider's published rates —
+# every budget decision derives from them. Verify before deploying; provider
+# pricing changes.
+
+backends:
+  # ── Cheap tier ────────────────────────────────────────────────────────
+  # Groq's free tier is generous and fast, which makes it a good default for
+  # a public demo: visitors need no API key of their own, and the cost of
+  # someone hammering the endpoint is zero.
+  - id: groq-llama-3.1-8b
+    provider: openai
+    model: llama-3.1-8b-instant
+    endpoint: "https://api.groq.com/openai/v1"
+    api_keys: ["${GROQ_API_KEY}"]
+    cost_per_1k_prompt: 0.00005
+    cost_per_1k_completion: 0.00008
+    tokenizer: cl100k_base
+    token_overhead_per_message: 4
+    capability_tier: 1
+    capabilities:
+      - json_mode
+    context_length: 131072
+
+  # ── Premium tier ──────────────────────────────────────────────────────
+  # Only reached when the router judges a request needs it, so the expensive
+  # per-token rate applies to a small share of traffic. Comment this block
+  # out to run the demo entirely on the free tier.
+  - id: openai-gpt-4o-mini
+    provider: openai
+    model: gpt-4o-mini
+    endpoint: "https://api.openai.com/v1"
+    api_keys: ["${OPENAI_API_KEY}"]
+    cost_per_1k_prompt: 0.00015
+    cost_per_1k_completion: 0.00060
+    tokenizer: cl100k_base
+    token_overhead_per_message: 4
+    capability_tier: 2
+    capabilities:
+      - json_mode
+    context_length: 128000
+
+  # ── Cross-vendor failover ─────────────────────────────────────────────
+  # A different vendor entirely, so an OpenAI outage does not take the
+  # gateway down with it. This is the thing an in-house router cannot do for
+  # you: OpenAI will never fail your traffic over to Anthropic.
+  - id: anthropic-claude-haiku
+    provider: anthropic
+    model: claude-3-5-haiku-20241022
+    endpoint: "https://api.anthropic.com/v1"
+    api_keys: ["${ANTHROPIC_API_KEY}"]
+    cost_per_1k_prompt: 0.00080
+    cost_per_1k_completion: 0.00400
+    tokenizer: cl100k_base
+    token_overhead_per_message: 4
+    capability_tier: 2
+    capabilities:
+      - json_mode
+    context_length: 200000
