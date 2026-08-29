@@ -108,7 +108,8 @@ class PiiVault:
 
         vault_mapping: Dict[str, str] = {}
         counters: Dict[str, int] = {}
-        sanitized = self._mask_one(text, vault_mapping, counters)
+        seen: Dict[Tuple[str, str], str] = {}
+        sanitized = self._mask_one(text, vault_mapping, counters, seen)
         return sanitized, vault_mapping
 
     def _mask_one(
@@ -116,20 +117,41 @@ class PiiVault:
         text: str,
         vault_mapping: Dict[str, str],
         counters: Dict[str, int],
+        seen: Dict[Tuple[str, str], str],
     ) -> str:
         """Mask every pattern in `text`, recording placeholders into
-        `vault_mapping` and advancing the shared `counters`."""
+        `vault_mapping` and advancing the shared `counters`.
+
+        `seen` maps a value to the placeholder already issued for it, so one
+        value keeps one placeholder wherever it appears."""
         sanitized = text
         for label, pattern in self.patterns.items():
-            matches = list(pattern.finditer(sanitized))
-            # Process matches in reverse order so character offsets stay valid
-            for match in reversed(matches):
-                val = match.group(0)
-                if not self._accepts(label, val):
-                    continue
-                counters[label] = counters.get(label, 0) + 1
-                token = f"[{label}_{counters[label]}]"
-                vault_mapping[token] = val
+            matches = [
+                m
+                for m in pattern.finditer(sanitized)
+                if self._accepts(label, m.group(0))
+            ]
+
+            # Issue tokens in reading order, so [EMAIL_1] is the first address
+            # in the text rather than the last. Substitution then runs in
+            # reverse, which is what keeps earlier offsets valid.
+            tokens = []
+            for match in matches:
+                value = match.group(0)
+                token = seen.get((label, value))
+                if token is None:
+                    # A value that has been masked before keeps its original
+                    # placeholder. Numbering each occurrence separately told
+                    # the model that one address repeated twice was two
+                    # different addresses, and no answer that depends on them
+                    # being the same could then be right.
+                    counters[label] = counters.get(label, 0) + 1
+                    token = f"[{label}_{counters[label]}]"
+                    seen[(label, value)] = token
+                    vault_mapping[token] = value
+                tokens.append(token)
+
+            for match, token in zip(reversed(matches), reversed(tokens)):
                 sanitized = (
                     sanitized[: match.start()] + token + sanitized[match.end() :]
                 )
@@ -143,6 +165,9 @@ class PiiVault:
         every occurrence correctly."""
         vault_mapping: Dict[str, str] = {}
         counters: Dict[str, int] = {}
+        # Shared across messages too: an address in the system prompt and the
+        # same address in the user turn are one value, not two.
+        seen: Dict[Tuple[str, str], str] = {}
         masked_messages: List[Dict[str, str]] = []
 
         for msg in messages:
@@ -153,19 +178,106 @@ class PiiVault:
                 )
                 continue
 
-            sanitized = self._mask_one(content, vault_mapping, counters)
+            sanitized = self._mask_one(content, vault_mapping, counters, seen)
             masked_messages.append({"role": msg.get("role", ""), "content": sanitized})
 
         return masked_messages, vault_mapping
 
     def restore_text(self, text: str, vault_mapping: Dict[str, str]) -> str:
+        """Swap placeholders back for the values they stand for.
+
+        An exact string match was too strict: models reformat, and
+        `[email_1]` in prose or a bracket-less `EMAIL_1` in a list left the
+        caller looking at the gateway's internal plumbing. Case and the
+        separator are therefore allowed to vary.
+
+        The bracket-less form still requires the underscore — accepting a
+        bare `EMAIL 1` would start rewriting ordinary prose.
+        """
         if not text or not vault_mapping:
             return text
 
-        restored = text
-        for token, original_val in vault_mapping.items():
-            restored = restored.replace(token, original_val)
-        return restored
+        # One pass over the text rather than a replace per token, so a value
+        # that has just been restored is never rescanned as if it were
+        # another placeholder.
+        tokens = sorted(vault_mapping, key=len, reverse=True)
+        alternatives = []
+        for i, token in enumerate(tokens):
+            label, _, number = token.strip("[]").rpartition("_")
+            label_re = re.escape(label)
+            number_re = re.escape(number)
+            alternatives.append(
+                rf"(?P<t{i}>\[\s*{label_re}[\s_-]*{number_re}\s*\]"
+                rf"|\b{label_re}_{number_re}\b)"
+            )
+
+        combined = re.compile("|".join(alternatives), re.IGNORECASE)
+
+        def resolve(match: "re.Match[str]") -> str:
+            name = match.lastgroup
+            if name is None:
+                # Unreachable: every alternative above is a named group. If it
+                # ever happens, leave the text as found rather than raising —
+                # a visible placeholder beats a failed response.
+                return match.group(0)
+            return vault_mapping[tokens[int(name[1:])]]
+
+        return combined.sub(resolve, text)
+
+
+class VaultRestorer:
+    """Restores vault placeholders in a response that arrives in pieces.
+
+    Restoring per chunk cannot work: a placeholder split as `[EMA` + `IL_1`
+    + `] to` appears in no chunk whole, so the swap never happens and the
+    caller is shown `[EMAIL_1]` — the gateway's internal plumbing — where
+    their own address should be. The non-streaming path, handed the whole
+    string at once, got this right, which is what kept it hidden.
+
+    The fix is to release text only up to the last point a placeholder could
+    still be forming, and hold the rest until it completes.
+
+    Bracket-less placeholders (`EMAIL_1`, which `restore_text` also accepts
+    because models reformat) are not tracked here: recognising one before it
+    is complete would mean holding back on any capitalised word. A model that
+    both drops the brackets and is cut mid-token leaves that one placeholder
+    unrestored.
+    """
+
+    # Longest real placeholder is around 22 characters
+    # ("[EMAIL_OBFUSCATED_12]"). Past this a bracket is ordinary text and
+    # holding for it would stall the stream.
+    MAX_TOKEN_LEN = 64
+
+    def __init__(self, vault: "PiiVault", mapping: Dict[str, str]):
+        self._vault = vault
+        self._mapping = mapping
+        self._pending = ""
+
+    def feed(self, text: str) -> str:
+        """Take the next piece; return what can be restored and sent now."""
+        if not self._mapping:
+            return text  # nothing was masked, so nothing can be split
+        self._pending += text
+        boundary = self._boundary(self._pending)
+        ready, self._pending = self._pending[:boundary], self._pending[boundary:]
+        return self._vault.restore_text(ready, self._mapping)
+
+    def flush(self) -> str:
+        """Release the held tail once no more text can arrive."""
+        if not self._pending:
+            return ""
+        ready, self._pending = self._pending, ""
+        return self._vault.restore_text(ready, self._mapping)
+
+    def _boundary(self, text: str) -> int:
+        """How much of *text* is past any placeholder still being written."""
+        opened = text.rfind("[")
+        if opened == -1 or "]" in text[opened:]:
+            return len(text)  # no open bracket, so nothing is half-written
+        if len(text) - opened > self.MAX_TOKEN_LEN:
+            return len(text)  # too long to be a placeholder; a stray bracket
+        return opened
 
 
 class PiiSanitizer:

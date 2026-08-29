@@ -39,7 +39,7 @@ from gateway.policy.guardrails import (
     GuardrailViolationException,
     StreamingOutputFilter,
 )
-from gateway.policy.pii import PiiSanitizer, PiiVault
+from gateway.policy.pii import PiiSanitizer, PiiVault, VaultRestorer
 from gateway.policy.router import (
     ContextLengthExceededException,
     DeadlineExceededException,
@@ -179,24 +179,18 @@ def _adapter_cost(
     ) * adapter.cost_per_1k_completion
 
 
-def _stream_chunk_with(
-    chunk: Dict[str, Any],
-    text: str,
-    vault_mapping: Dict[str, str],
-    pii_vault: PiiVault,
-) -> Dict[str, Any]:
+def _stream_chunk_with(chunk: Dict[str, Any], text: str) -> Dict[str, Any]:
     """Rebuild *chunk* carrying *text* as its delta content.
 
-    Guardrail screening decides what may be sent, which is not always what
-    arrived — text is held back until enough of it exists to recognise a
-    secret spanning a chunk boundary. PII restore happens here, after
-    screening, so redaction still runs on the masked form.
+    What may be sent is not what arrived: two stages upstream hold text back
+    until it is whole — guardrail screening until a secret spanning a chunk
+    boundary can be recognised, vault restore until a placeholder can be
+    swapped back.
     """
     choices = chunk.get("choices") or [{}]
     delta = choices[0].get("delta") or {}
-    restored = pii_vault.restore_text(text, vault_mapping) if vault_mapping else text
     out = dict(chunk)
-    out["choices"] = [{**choices[0], "delta": {**delta, "content": restored}}] + list(
+    out["choices"] = [{**choices[0], "delta": {**delta, "content": text}}] + list(
         choices[1:]
     )
     return out
@@ -774,6 +768,10 @@ async def chat_completions(
             # its own, and a leak found after the last chunk is a leak the
             # client has already read.
             output_filter = StreamingOutputFilter(state.guardrails_pipeline)
+            # Restore runs after screening, on the same held-back-until-whole
+            # principle: redaction must see the masked form, and a placeholder
+            # split across chunks cannot be swapped back.
+            vault_restorer = VaultRestorer(state.pii_vault, vault_mapping)
 
             with GatewayTracer.trace_span(
                 "chat.completion.stream",
@@ -826,25 +824,28 @@ async def chat_completions(
                             break
 
                         if finish_reason:
-                            # No more text can arrive, so release the held tail
-                            # here — after this chunk the client stops reading.
+                            # No more text can arrive, so release both held
+                            # tails here — after this chunk the client stops
+                            # reading.
                             safe += output_filter.flush()
+                            ready = vault_restorer.feed(safe) + vault_restorer.flush()
+                        else:
+                            ready = vault_restorer.feed(safe)
 
-                        if safe or finish_reason:
-                            outgoing = _stream_chunk_with(
-                                chunk, safe, vault_mapping, state.pii_vault
-                            )
+                        if ready or finish_reason:
+                            outgoing = _stream_chunk_with(chunk, ready)
                             yield f"data: {json.dumps(outgoing)}\n\n"
 
                     # A stream that ends without a finish_reason still has a
                     # tail held back; releasing it is what keeps the client's
                     # text identical to the non-streaming answer.
                     if not output_filter.leaked:
-                        tail = output_filter.flush()
+                        tail = (
+                            vault_restorer.feed(output_filter.flush())
+                            + vault_restorer.flush()
+                        )
                         if tail:
-                            outgoing = _stream_chunk_with(
-                                last_chunk or {}, tail, vault_mapping, state.pii_vault
-                            )
+                            outgoing = _stream_chunk_with(last_chunk or {}, tail)
                             yield f"data: {json.dumps(outgoing)}\n\n"
 
                     if output_filter.redacted:
