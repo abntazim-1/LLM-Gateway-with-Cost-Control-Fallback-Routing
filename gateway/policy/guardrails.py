@@ -30,6 +30,23 @@ _PRIOR_QUALIFIERS = (
 )
 
 
+# ── Streaming output screening ───────────────────────────────────────────
+# The first characters of every secret in `output_secret_patterns`. A secret
+# cannot exist without one, so these are the only places a match can begin —
+# which is what makes it safe to release everything else immediately instead
+# of buffering the whole response.
+_SECRET_STARTERS = re.compile(
+    r"sk-|AKIA|ASIA|gh[pousr]_|xox[baprs]-|eyJ|Bearer\s", re.IGNORECASE
+)
+# The longest starter ("Bearer ") is 7 characters. Holding back 6 makes it
+# impossible for a starter to be split across an emit boundary and missed,
+# which would defeat the scheme entirely.
+_MIN_HOLDBACK = 6
+# How far back a secret that is still arriving may have begun. JWTs are the
+# long case; beyond this a starter is treated as ordinary text.
+_MAX_SECRET_SPAN = 512
+
+
 class GuardrailsPipeline:
     """
     Content safety and security guardrails pipeline.
@@ -38,9 +55,12 @@ class GuardrailsPipeline:
     Input screening normalizes text first (see `normalize_for_matching`) so
     zero-width characters, homoglyphs, and leetspeak cannot slip a known
     pattern through. Pattern matching still only covers English phrasings it
-    has seen — a paraphrase in another language reads as different text — so
-    an optional semantic classifier can be layered on top; see
-    `gateway.policy.classifier`.
+    has seen — a paraphrase in another language reads as different text, which
+    the eval set records as a known gap rather than papering over.
+
+    Output screening must be driven through `StreamingOutputFilter` when the
+    response is streamed; calling the per-chunk methods directly cannot work,
+    for the reasons documented on that class.
     """
 
     def __init__(self):
@@ -197,6 +217,48 @@ class GuardrailsPipeline:
 
         return completion_text, False
 
+    def emit_boundary(self, text: str) -> int:
+        """How much of *text* can be released without splitting a secret.
+
+        Redaction is a whole-string operation: `sk-abc...` arriving as
+        `sk-a` + `bc...` matches neither piece. Streaming therefore has to
+        hold back any tail that could still grow into a secret, and release
+        everything before it.
+
+        Returns an index into *text*; the caller emits up to it and keeps the
+        rest for the next chunk.
+        """
+        n = len(text)
+        # Never release the last few characters: a starter split across the
+        # boundary would never be recognised on either side of it.
+        boundary = max(0, n - _MIN_HOLDBACK)
+
+        window = max(0, n - _MAX_SECRET_SPAN)
+        for starter in _SECRET_STARTERS.finditer(text, window):
+            start = starter.start()
+            if start >= boundary:
+                break
+            tail = text[start:]
+            # A secret that has already matched in full, with text after it,
+            # has stopped growing.
+            finished = None
+            for pattern in self.output_secret_patterns.values():
+                match = pattern.match(tail)
+                if match and match.end() < len(tail):
+                    finished = match
+                    break
+
+            # Release it only if the whole match sits inside the prefix being
+            # emitted. Otherwise the cut would land inside the secret, and the
+            # half left behind would no longer look like one — which is how a
+            # trailing character used to escape redaction.
+            if finished and start + finished.end() <= boundary:
+                continue
+
+            boundary = start
+
+        return boundary
+
     def validate_completion(self, completion_text: str) -> None:
         """Validate output completion text against output guardrail rules.
 
@@ -209,3 +271,79 @@ class GuardrailsPipeline:
                 raise GuardrailViolationException(
                     f"Output Guardrail Violation: completion leaked system instructions (pattern: '{pattern.pattern}')"
                 )
+
+
+class StreamingOutputFilter:
+    """Applies the output guardrails to a response that arrives in pieces.
+
+    Both output guardrails are whole-string operations, and streaming gives
+    them neither the whole string nor a second chance:
+
+    * secret redaction was run per chunk, so a key arriving as `sk-pro` +
+      `j-AbCd` + `EfGh` matched nothing and reassembled intact in the client
+    * leak validation ran after the last chunk, by which point every chunk
+      had already been sent — it could only decline to cache what the client
+      had already read
+
+    This class holds back the smallest tail that could still grow into a
+    secret (see `emit_boundary`) and checks the leak patterns against the
+    unsent text as well as the sent text, so a leak recognised while it is
+    still pending never reaches the client at all.
+
+    Detection cannot be made perfect on a stream: a leak phrase spanning the
+    boundary may be partly released before it is recognisable. What stopping
+    at that point protects is the payload after the phrase, which is the part
+    that matters.
+    """
+
+    def __init__(self, pipeline: GuardrailsPipeline):
+        self._pipeline = pipeline
+        self._pending = ""
+        self._released = ""
+        self.leaked = False
+        self.redacted = False
+
+    def feed(self, delta: str) -> str:
+        """Take the next piece; return only what is now safe to send."""
+        if self.leaked:
+            return ""
+        self._pending += delta
+
+        if self._is_leak(self._released + self._pending):
+            # Caught before release: drop the tail and stop the stream.
+            self.leaked = True
+            self._pending = ""
+            return ""
+
+        boundary = self._pipeline.emit_boundary(self._pending)
+        return self._release(self._pending[:boundary], boundary)
+
+    def flush(self) -> str:
+        """Release the held tail once no more text can arrive."""
+        if self.leaked:
+            return ""
+        if self._is_leak(self._released + self._pending):
+            self.leaked = True
+            self._pending = ""
+            return ""
+        return self._release(self._pending, len(self._pending))
+
+    def _release(self, raw: str, consumed: int) -> str:
+        safe = self._pipeline.sanitize_completion(raw)
+        if safe != raw:
+            self.redacted = True
+        self._pending = self._pending[consumed:]
+        self._released += safe
+        return safe
+
+    def _is_leak(self, text: str) -> bool:
+        try:
+            self._pipeline.validate_completion(text)
+            return False
+        except GuardrailViolationException:
+            return True
+
+    @property
+    def text(self) -> str:
+        """Everything seen so far, redacted — for billing and cache decisions."""
+        return self._released + self._pending

@@ -34,7 +34,11 @@ from gateway.ledger.store import LedgerStore
 from gateway.policy.budget import BudgetExceededException, BudgetPolicy
 from gateway.policy.cache import PromptCache
 from gateway.policy.circuit_breaker import CircuitBreakerRegistry
-from gateway.policy.guardrails import GuardrailsPipeline, GuardrailViolationException
+from gateway.policy.guardrails import (
+    GuardrailsPipeline,
+    GuardrailViolationException,
+    StreamingOutputFilter,
+)
 from gateway.policy.pii import PiiSanitizer, PiiVault
 from gateway.policy.router import (
     ContextLengthExceededException,
@@ -42,8 +46,23 @@ from gateway.policy.router import (
     NoAvailableBackendException,
     Router,
 )
-from gateway.telemetry.metrics import observe_cache, observe_request
+from gateway.telemetry.metrics import (
+    observe_cache,
+    observe_guardrail_block,
+    observe_guardrail_redaction,
+    observe_request,
+)
 from gateway.telemetry.tracer import GatewayTracer
+
+# Sent in place of the rest of a stream that was stopped mid-flight. Shaped
+# like the other SSE error events so an OpenAI-compatible client handles it
+# without special-casing.
+GUARDRAIL_STREAM_ERROR = {
+    "error": {
+        "message": "Response withheld by output guardrail",
+        "type": "guardrail_violation",
+    }
+}
 
 
 class JsonFormatter(logging.Formatter):
@@ -160,37 +179,27 @@ def _adapter_cost(
     ) * adapter.cost_per_1k_completion
 
 
-def _finalize_stream_chunk(
+def _stream_chunk_with(
     chunk: Dict[str, Any],
+    text: str,
     vault_mapping: Dict[str, str],
     pii_vault: PiiVault,
-    guardrails_pipeline: GuardrailsPipeline,
-) -> tuple:
-    """Apply output-guardrail secret redaction (on masked text) and PII vault
-    restore to a streaming chunk's delta content.
+) -> Dict[str, Any]:
+    """Rebuild *chunk* carrying *text* as its delta content.
 
-    Returns (masked_content_for_accumulation, outgoing_chunk). Masked tokens
-    contain no spaces, so word-level deltas keep them intact."""
-    choices = chunk.get("choices") or []
-    if not choices:
-        return None, chunk
+    Guardrail screening decides what may be sent, which is not always what
+    arrived — text is held back until enough of it exists to recognise a
+    secret spanning a chunk boundary. PII restore happens here, after
+    screening, so redaction still runs on the masked form.
+    """
+    choices = chunk.get("choices") or [{}]
     delta = choices[0].get("delta") or {}
-    content = delta.get("content", "")
-    if not content:
-        return "", chunk
-
-    content = guardrails_pipeline.sanitize_completion(content)
-
-    restored = (
-        pii_vault.restore_text(content, vault_mapping) if vault_mapping else content
+    restored = pii_vault.restore_text(text, vault_mapping) if vault_mapping else text
+    out = dict(chunk)
+    out["choices"] = [{**choices[0], "delta": {**delta, "content": restored}}] + list(
+        choices[1:]
     )
-    if restored == delta.get("content", ""):
-        return content, chunk  # nothing redacted or restored; skip the copy
-
-    delta_copy = {**delta, "content": restored}
-    chunk_copy = dict(chunk)
-    chunk_copy["choices"] = [{**choices[0], "delta": delta_copy}] + list(choices[1:])
-    return content, chunk_copy
+    return out
 
 
 async def health_check_loop():
@@ -597,6 +606,10 @@ async def chat_completions(
     try:
         state.guardrails_pipeline.validate_messages(messages)
     except GuardrailViolationException as e:
+        # Counted so over-blocking is visible. A false positive here looks
+        # like nothing at all from the outside: the caller gets a 400 and
+        # stops using the gateway rather than reporting it.
+        observe_guardrail_block("input_injection")
         raise HTTPException(status_code=400, detail=str(e))
 
     # PII masking (reversible): the LLM only ever sees placeholders; the
@@ -756,6 +769,11 @@ async def chat_completions(
             backend_info: Dict[str, str] = {}
             stream_usage: Dict[str, int] = {}
             reconciled = False
+            # Output screening is stateful across chunks: a secret split over
+            # a chunk boundary matches nothing when each piece is checked on
+            # its own, and a leak found after the last chunk is a leak the
+            # client has already read.
+            output_filter = StreamingOutputFilter(state.guardrails_pipeline)
 
             with GatewayTracer.trace_span(
                 "chat.completion.stream",
@@ -772,14 +790,6 @@ async def chat_completions(
                         sanitized_messages, backend_info=backend_info, **kwargs
                     ):
                         last_chunk = chunk
-                        masked_delta, outgoing = _finalize_stream_chunk(
-                            chunk,
-                            vault_mapping,
-                            state.pii_vault,
-                            state.guardrails_pipeline,
-                        )
-                        if masked_delta:
-                            accumulated_text += masked_delta
                         # Capture the model from the first chunk that has it
                         if chunk.get("model") and stream_model == "unknown":
                             stream_model = chunk["model"]
@@ -791,16 +801,55 @@ async def chat_completions(
                         # estimate, so keep it if it arrives.
                         if chunk.get("usage"):
                             stream_usage = chunk["usage"]
-                        yield f"data: {json.dumps(outgoing)}\n\n"
 
-                    # ── Output guardrail validation on the full completion ────
-                    try:
-                        state.guardrails_pipeline.validate_completion(accumulated_text)
-                    except GuardrailViolationException as e:
-                        # Chunks were already streamed to the client; flag so
-                        # the completion is not cached and the event is auditable.
-                        guardrail_flagged = True
-                        logging.warning(f"{e} (request {request_id})")
+                        choices = chunk.get("choices") or []
+                        if not choices:
+                            yield f"data: {json.dumps(chunk)}\n\n"
+                            continue
+
+                        delta = choices[0].get("delta") or {}
+                        finish_reason = choices[0].get("finish_reason")
+                        raw = delta.get("content") or ""
+
+                        safe = output_filter.feed(raw) if raw else ""
+                        if output_filter.leaked:
+                            # Recognised while still held back, so the payload
+                            # after the giveaway phrase is never sent. Billing
+                            # below still runs: the tokens were generated.
+                            guardrail_flagged = True
+                            observe_guardrail_block("output_leak")
+                            logging.warning(
+                                "Output guardrail: completion leaked system "
+                                f"instructions; stream stopped (request {request_id})"
+                            )
+                            yield f"data: {json.dumps(GUARDRAIL_STREAM_ERROR)}\n\n"
+                            break
+
+                        if finish_reason:
+                            # No more text can arrive, so release the held tail
+                            # here — after this chunk the client stops reading.
+                            safe += output_filter.flush()
+
+                        if safe or finish_reason:
+                            outgoing = _stream_chunk_with(
+                                chunk, safe, vault_mapping, state.pii_vault
+                            )
+                            yield f"data: {json.dumps(outgoing)}\n\n"
+
+                    # A stream that ends without a finish_reason still has a
+                    # tail held back; releasing it is what keeps the client's
+                    # text identical to the non-streaming answer.
+                    if not output_filter.leaked:
+                        tail = output_filter.flush()
+                        if tail:
+                            outgoing = _stream_chunk_with(
+                                last_chunk or {}, tail, vault_mapping, state.pii_vault
+                            )
+                            yield f"data: {json.dumps(outgoing)}\n\n"
+
+                    if output_filter.redacted:
+                        observe_guardrail_redaction()
+                    accumulated_text = output_filter.text
 
                     # ── Spend recording ────────────────────────────────────────
                     latency_ms = (time.time() - stream_start) * 1000.0
@@ -1051,11 +1100,14 @@ async def chat_completions(
             state.guardrails_pipeline.sanitize_completion(m.content)
             for m in backend_response.messages
         ]
+        if sanitized_contents != [m.content for m in backend_response.messages]:
+            observe_guardrail_redaction()
         try:
             state.guardrails_pipeline.validate_completion("\n".join(sanitized_contents))
         except GuardrailViolationException as e:
             if span:
                 span.set_attribute("guardrail_violation", True)
+            observe_guardrail_block("output_leak")
             raise HTTPException(status_code=400, detail=str(e))
 
         # JSON mode was used to *route* to a capable backend but the output

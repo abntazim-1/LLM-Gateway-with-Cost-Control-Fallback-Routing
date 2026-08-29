@@ -88,6 +88,36 @@ DEADLINE_EXCEEDED_TOTAL = Counter(
 )
 
 
+# Guardrails were the only policy with no counter, so there was no way to see
+# either failure mode. Blocking is invisible by design — the caller gets an
+# error and goes away — which makes over-blocking the more dangerous of the
+# two: a pattern that starts catching ordinary traffic produces silence, not
+# a bug report.
+GUARDRAIL_BLOCKED_TOTAL = Counter(
+    "gateway_guardrail_blocked_total",
+    "Requests or responses stopped by a guardrail",
+    ["stage"],
+)
+
+# Redaction is not a block — the response is still delivered, minus the
+# secret. Counted separately so it is not read as traffic being refused.
+GUARDRAIL_REDACTED_TOTAL = Counter(
+    "gateway_guardrail_redacted_total",
+    "Responses that had a secret redacted before delivery",
+)
+
+
+def observe_guardrail_block(stage: str):
+    """A guardrail stopped something. `stage` is where: input_injection,
+    output_leak."""
+    GUARDRAIL_BLOCKED_TOTAL.labels(stage=stage).inc()
+
+
+def observe_guardrail_redaction():
+    """A secret was stripped from a response that was still delivered."""
+    GUARDRAIL_REDACTED_TOTAL.inc()
+
+
 def observe_request(backend: str, status: str, latency: float, cost: float):
     REQUESTS_TOTAL.labels(backend=backend, status=status).inc()
     LATENCY_MS.labels(backend=backend).observe(latency)
