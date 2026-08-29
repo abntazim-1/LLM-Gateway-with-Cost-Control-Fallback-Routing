@@ -4,7 +4,7 @@ import pytest
 
 from gateway.ledger.async_queue import AsyncLedgerQueue
 from gateway.ledger.base_store import BaseLedgerStore
-from gateway.ledger.store import LedgerStore
+from gateway.ledger.store import LedgerStore, hash_api_key
 
 
 @pytest.mark.asyncio
@@ -42,7 +42,8 @@ async def test_async_ledger_queue_buffering():
     requests = await store.get_all_requests(limit=10)
     assert len(requests) == 1
     assert requests[0]["id"] == "async-req-1"
-    assert requests[0]["api_key"] == "sk-async-test"
+    # Stored as a digest — the plaintext key is never persisted.
+    assert requests[0]["api_key"] == hash_api_key("sk-async-test")
 
 
 def test_ledger_store_isinstance_of_base():

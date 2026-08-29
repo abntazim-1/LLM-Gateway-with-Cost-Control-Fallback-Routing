@@ -1,9 +1,11 @@
 import os
+import secrets
 
 from fastapi import HTTPException, Security, status
 from fastapi.security import APIKeyHeader
 
 from gateway import load_config
+from gateway.ledger.store import hash_api_key
 
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 
@@ -32,6 +34,7 @@ def load_api_keys(ledger_store=None) -> None:
         try:
             records = ledger_store.get_all_api_keys_and_limits_sync()
             VALID_API_KEYS.clear()
+            # Already digests — the store hashes on write.
             VALID_API_KEYS.update(r["api_key"] for r in records)
 
             RATE_LIMIT_RULES.clear()
@@ -53,11 +56,16 @@ def load_api_keys(ledger_store=None) -> None:
             budgets = (
                 parsed.get("budgets", parsed) if isinstance(parsed, dict) else parsed
             )
+            # Config and env carry keys in the clear; hash at the boundary so
+            # only digests are held in memory.
             VALID_API_KEYS.clear()
-            VALID_API_KEYS.update(b["api_key"] for b in budgets)
+            VALID_API_KEYS.update(hash_api_key(b["api_key"]) for b in budgets)
             RATE_LIMIT_RULES.clear()
             RATE_LIMIT_RULES.update(
-                {b["api_key"]: b.get("requests_per_minute", 60) for b in budgets}
+                {
+                    hash_api_key(b["api_key"]): b.get("requests_per_minute", 60)
+                    for b in budgets
+                }
             )
             return
         except Exception:
@@ -70,11 +78,14 @@ def load_api_keys(ledger_store=None) -> None:
     try:
         budgets = load_config(config_path).get("budgets", [])
         VALID_API_KEYS.clear()
-        VALID_API_KEYS.update(b["api_key"] for b in budgets)
+        VALID_API_KEYS.update(hash_api_key(b["api_key"]) for b in budgets)
 
         RATE_LIMIT_RULES.clear()
         RATE_LIMIT_RULES.update(
-            {b["api_key"]: b.get("requests_per_minute", 60) for b in budgets}
+            {
+                hash_api_key(b["api_key"]): b.get("requests_per_minute", 60)
+                for b in budgets
+            }
         )
     except Exception:
         VALID_API_KEYS.clear()
@@ -95,7 +106,16 @@ async def verify_api_key(api_key_header: str = Security(api_key_header)) -> str:
         else api_key_header
     )
 
-    if token not in VALID_API_KEYS:
+    # Compare digests, never the key itself. VALID_API_KEYS holds hashes, so
+    # neither this process nor the database ever has the plaintext at rest.
+    token_digest = hash_api_key(token)
+
+    # secrets.compare_digest rather than `in`: set membership short-circuits
+    # on the first differing byte, so how long a rejection takes leaks how
+    # much of a guess was correct, and a key can be recovered a byte at a
+    # time. Comparing every candidate in constant time removes that signal.
+    # Matches how the admin token is already checked in main.py.
+    if not any(secrets.compare_digest(token_digest, known) for known in VALID_API_KEYS):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API Key",
@@ -111,4 +131,7 @@ async def verify_api_key(api_key_header: str = Security(api_key_header)) -> str:
     # If the ledger hasn't been injected yet (e.g. during early startup tests)
     # we allow the request through rather than hard-failing.
 
+    # The key itself. The store hashes on entry, so nothing readable is ever
+    # persisted — but the plaintext arrived in the request header anyway, so
+    # withholding it from callers here would buy nothing.
     return token

@@ -308,10 +308,11 @@ with tab2:
             # Budget limits table
             st.subheader("Client Budgets & Rate Limits")
             if not budgets_df.empty:
-                if "api_key" in budgets_df.columns:
-                    budgets_df["masked_api_key"] = budgets_df["api_key"].apply(
-                        lambda k: f"{k[:5]}...{k[-4:]}" if len(k) > 10 else k
-                    )
+                # api_key is a digest and unreadable, so identify a client by
+                # key_prefix — the only part of the real key still stored.
+                if "key_prefix" in budgets_df.columns:
+                    budgets_df["client"] = budgets_df["key_prefix"].fillna("") + "…"
+                    budgets_df = budgets_df.drop(columns=["api_key", "key_prefix"])
                 st.dataframe(budgets_df, width="stretch")
             else:
                 st.info("No budgets configured.")
@@ -322,10 +323,14 @@ with tab2:
             st.subheader("Recent Requests (Ledger)")
             if not requests_df.empty:
                 ledger_view = requests_df.copy()
+                # The ledger stores only the digest. A short slice of it is
+                # enough to group a client's requests without identifying the
+                # key itself.
                 if "api_key" in ledger_view.columns:
-                    ledger_view["api_key"] = ledger_view["api_key"].apply(
-                        lambda k: f"{k[:5]}...{k[-4:]}" if len(k) > 10 else k
+                    ledger_view["client"] = ledger_view["api_key"].apply(
+                        lambda k: f"#{k[:8]}" if k else ""
                     )
+                    ledger_view = ledger_view.drop(columns=["api_key"])
                 if "timestamp" in ledger_view.columns:
                     ledger_view = ledger_view.sort_values("timestamp", ascending=False)
                 st.dataframe(ledger_view, width="stretch", hide_index=True)

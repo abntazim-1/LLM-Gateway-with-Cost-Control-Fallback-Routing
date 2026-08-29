@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 
 import gateway.main as main
 from gateway.adapters.base import BaseAdapter, NormalizedResponse
+from gateway.ledger.store import hash_api_key
 
 MAX_TOKENS_CEILING = 4000
 STREAMED_WORDS = ["yes"]
@@ -79,7 +80,9 @@ def _billed_cost(client, api_key, timeout_s: float = 5.0) -> float:
         rows = client.get(
             "/admin/requests?limit=50", headers={"X-Admin-Token": "test-admin-key"}
         ).json()
-        mine = [r for r in rows if r["api_key"] == api_key]
+        # The ledger identifies a client by digest — the plaintext key is
+        # deliberately not stored, so match on the hash.
+        mine = [r for r in rows if r["api_key"] == hash_api_key(api_key)]
         if mine:
             return mine[0]["cost_usd"]
         if time.time() > deadline:

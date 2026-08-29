@@ -1,11 +1,39 @@
 import asyncio
+import hashlib
 import os
+import re
 import sqlite3
 import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from gateway.ledger.base_store import BaseLedgerStore
+
+# Client keys are stored as a digest, never in the clear, so a leaked database
+# yields nothing an attacker can present as a credential. Only the caller ever
+# holds the real key — the same reason password hashes exist.
+#
+# A plain SHA-256 rather than a slow KDF is deliberate: these are
+# high-entropy random tokens, not user-chosen passwords, so there is no
+# dictionary to attack and nothing for key-stretching to buy. It also runs on
+# every request, where a deliberately slow hash would be a throughput problem.
+_KEY_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+# Enough of the key to recognise a row in the dashboard without being enough
+# to use — the convention Stripe and GitHub follow.
+KEY_PREFIX_LEN = 10
+
+
+def hash_api_key(api_key: str) -> str:
+    """Digest used as a client key's identity everywhere in the system."""
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+
+
+def is_hashed(value: str) -> bool:
+    """Whether a stored identifier is already a digest.
+
+    Lets migration run repeatedly without re-hashing what it already hashed.
+    """
+    return bool(value) and bool(_KEY_DIGEST_RE.match(value))
 
 
 class LedgerStore(BaseLedgerStore):
@@ -57,6 +85,10 @@ class LedgerStore(BaseLedgerStore):
                 conn.execute("PRAGMA journal_mode=WAL").fetchall()
             conn.execute("PRAGMA synchronous=NORMAL").fetchall()
             conn.execute("PRAGMA busy_timeout=30000").fetchall()
+            # Overwrite deleted content rather than merely unlinking it. This
+            # database holds credential digests and spend records, and without
+            # this a deleted row's bytes remain readable in the file.
+            conn.execute("PRAGMA secure_delete=ON").fetchall()
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS budgets (
                     api_key TEXT PRIMARY KEY,
@@ -141,7 +173,71 @@ class LedgerStore(BaseLedgerStore):
                 "CREATE INDEX IF NOT EXISTS idx_feedback_request "
                 "ON feedback (request_id)"
             )
+            # Display label for a key whose plaintext is no longer stored.
+            # Added rather than assumed present, so an existing database
+            # upgrades in place instead of needing to be recreated.
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(budgets)")}
+            if "key_prefix" not in cols:
+                conn.execute("ALTER TABLE budgets ADD COLUMN key_prefix TEXT")
             conn.commit()
+            self._migrate_plaintext_keys(conn)
+
+    def _migrate_plaintext_keys(self, conn) -> None:
+        """Replace any plaintext key still stored with its digest.
+
+        A database written before keys were hashed holds them in the clear.
+        Rewriting them in place keeps existing clients working — they send the
+        same key, it hashes to the same digest — while removing the readable
+        copy. Every table keyed on api_key is migrated together, or spend
+        history would stop joining to the budget that produced it.
+        """
+        rows = conn.execute("SELECT api_key FROM budgets").fetchall()
+        stale = [r["api_key"] for r in rows if not is_hashed(r["api_key"])]
+        if not stale:
+            return
+
+        for plaintext in stale:
+            digest = hash_api_key(plaintext)
+            prefix = plaintext[:KEY_PREFIX_LEN]
+            # A digest may already exist if the same key was seen both ways;
+            # drop the plaintext row rather than violate the primary key.
+            clash = conn.execute(
+                "SELECT 1 FROM budgets WHERE api_key = ?", (digest,)
+            ).fetchone()
+            if clash:
+                conn.execute("DELETE FROM budgets WHERE api_key = ?", (plaintext,))
+            else:
+                conn.execute(
+                    "UPDATE budgets SET api_key = ?, key_prefix = ? WHERE api_key = ?",
+                    (digest, prefix, plaintext),
+                )
+            for table in ("requests", "feedback", "rate_limit_log"):
+                conn.execute(
+                    f"UPDATE {table} SET api_key = ? WHERE api_key = ?",
+                    (digest, plaintext),
+                )
+        conn.commit()
+
+        # An UPDATE leaves the previous value in freed pages, so the plaintext
+        # is still readable in the file after being logically replaced —
+        # verified by grepping the raw bytes. VACUUM rewrites the database
+        # without those pages.
+        #
+        # This is a best effort, not a secure erase: copies may persist in the
+        # WAL, in filesystem free space, or in backups taken before the
+        # upgrade. Anything truly sensitive should be rotated, not just
+        # rewritten.
+        try:
+            # In WAL mode the rewritten rows live in the -wal file, and VACUUM
+            # alone leaves the old pages in the main database untouched —
+            # confirmed by grepping the file after migrating. Checkpointing
+            # first folds the changes in so VACUUM has something to compact.
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.execute("VACUUM")
+        except sqlite3.OperationalError:
+            # VACUUM cannot run inside a transaction or on some connections;
+            # the migration itself has already succeeded either way.
+            pass
 
     async def load_budgets_from_config(self, budgets_config: list):
         """Seed initial budgets from config asynchronously."""
@@ -155,17 +251,21 @@ class LedgerStore(BaseLedgerStore):
             conn = self._get_connection()
             for b in budgets_config:
                 rpm = b.get("requests_per_minute", 60)
+                # Config carries the key in the clear; it is hashed here, at
+                # the boundary, so the plaintext never reaches storage.
+                plaintext = b["api_key"]
                 conn.execute(
                     """
-                    INSERT INTO budgets (api_key, daily_limit_usd, monthly_limit_usd, requests_per_minute, last_reset_date, last_reset_month)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO budgets (api_key, key_prefix, daily_limit_usd, monthly_limit_usd, requests_per_minute, last_reset_date, last_reset_month)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(api_key) DO UPDATE SET
                     daily_limit_usd=excluded.daily_limit_usd,
                     monthly_limit_usd=excluded.monthly_limit_usd,
                     requests_per_minute=excluded.requests_per_minute
                 """,
                     (
-                        b["api_key"],
+                        hash_api_key(plaintext),
+                        plaintext[:KEY_PREFIX_LEN],
                         b["daily_limit_usd"],
                         b["monthly_limit_usd"],
                         rpm,
@@ -179,6 +279,10 @@ class LedgerStore(BaseLedgerStore):
         return await asyncio.to_thread(self._get_budget_sync, api_key)
 
     def _get_budget_sync(self, api_key: str) -> Optional[Dict[str, Any]]:
+        # Callers pass the key as the client presented it; it is hashed
+        # here so only the digest is ever stored or matched on.
+        api_key = hash_api_key(api_key)
+
         now_utc = datetime.now(timezone.utc)
         today_str = now_utc.strftime("%Y-%m-%d")
         month_str = now_utc.strftime("%Y-%m")
@@ -265,6 +369,9 @@ class LedgerStore(BaseLedgerStore):
         latency: float,
         reserved_cost: float = 0.0,
     ):
+        # Callers pass the key as the client presented it; it is hashed
+        # here so only the digest is ever stored or matched on.
+        api_key = hash_api_key(api_key)
         with self._write_lock:
             conn = self._get_connection()
             conn.execute(
@@ -353,8 +460,12 @@ class LedgerStore(BaseLedgerStore):
 
     def _get_all_budgets_sync(self) -> list:
         conn = self._get_connection()
+        # key_prefix is what an operator recognises a client by; api_key is a
+        # digest and unreadable. Both are returned so callers can identify a
+        # row without the plaintext existing anywhere.
         rows = conn.execute(
-            "SELECT api_key, daily_limit_usd, spend_today, monthly_limit_usd, spend_month FROM budgets"
+            "SELECT api_key, key_prefix, daily_limit_usd, spend_today, "
+            "monthly_limit_usd, spend_month FROM budgets"
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -393,6 +504,9 @@ class LedgerStore(BaseLedgerStore):
         api_key: Optional[str],
         comment: Optional[str],
     ) -> None:
+        # Only used when the request row is missing; hashed for consistency
+        # with every other api_key column so the two can be joined.
+        api_key = hash_api_key(api_key) if api_key else None
         with self._write_lock:
             conn = self._get_connection()
             row = conn.execute(
@@ -459,12 +573,18 @@ class LedgerStore(BaseLedgerStore):
         monthly_limit_usd: float,
         requests_per_minute: Optional[int] = None,
     ) -> bool:
+        # The admin API supplies the key in the clear — it is either minting a
+        # new one or naming an existing one. Hashing here means the plaintext
+        # exists only for the duration of this call.
+        digest = hash_api_key(api_key)
+        prefix = api_key[:KEY_PREFIX_LEN]
+
         with self._write_lock:
             conn = self._get_connection()
             # Check if key exists
             row = conn.execute(
                 "SELECT api_key, requests_per_minute FROM budgets WHERE api_key = ?",
-                (api_key,),
+                (digest,),
             ).fetchone()
             rpm = (
                 requests_per_minute
@@ -474,21 +594,21 @@ class LedgerStore(BaseLedgerStore):
             if row:
                 conn.execute(
                     """
-                    UPDATE budgets 
+                    UPDATE budgets
                     SET daily_limit_usd = ?, monthly_limit_usd = ?, requests_per_minute = ?
                     WHERE api_key = ?
                 """,
-                    (daily_limit_usd, monthly_limit_usd, rpm, api_key),
+                    (daily_limit_usd, monthly_limit_usd, rpm, digest),
                 )
                 conn.commit()
                 return True
             else:
                 conn.execute(
                     """
-                    INSERT INTO budgets (api_key, daily_limit_usd, monthly_limit_usd, requests_per_minute, spend_today, spend_month)
-                    VALUES (?, ?, ?, ?, 0.0, 0.0)
+                    INSERT INTO budgets (api_key, key_prefix, daily_limit_usd, monthly_limit_usd, requests_per_minute, spend_today, spend_month)
+                    VALUES (?, ?, ?, ?, ?, 0.0, 0.0)
                 """,
-                    (api_key, daily_limit_usd, monthly_limit_usd, rpm),
+                    (digest, prefix, daily_limit_usd, monthly_limit_usd, rpm),
                 )
                 conn.commit()
                 return False
@@ -506,6 +626,10 @@ class LedgerStore(BaseLedgerStore):
     ) -> Dict[str, Any]:
         """Single-transaction atomic check + reserve under the write lock."""
         from gateway.policy.budget import BudgetExceededException
+
+        # Callers pass the key as the client presented it; it is hashed
+        # here so only the digest is ever stored or matched on.
+        api_key = hash_api_key(api_key)
 
         with self._write_lock:
             conn = self._get_connection()
@@ -615,6 +739,9 @@ class LedgerStore(BaseLedgerStore):
         await asyncio.to_thread(self._check_rate_limit_sync, api_key)
 
     def _check_rate_limit_sync(self, api_key: str) -> None:
+        # Callers pass the key as the client presented it; it is hashed
+        # here so only the digest is ever stored or matched on.
+        api_key = hash_api_key(api_key)
         import time
 
         from fastapi import HTTPException

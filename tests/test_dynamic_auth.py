@@ -5,7 +5,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from gateway.auth import RATE_LIMIT_RULES, VALID_API_KEYS, load_api_keys, verify_api_key
-from gateway.ledger.store import LedgerStore
+from gateway.ledger.store import LedgerStore, hash_api_key
 from gateway.main import app
 
 
@@ -33,10 +33,12 @@ async def test_dynamic_auth_and_rate_limits():
     # Load keys into memory using our dynamic loader
     load_api_keys(ledger_store=ledger)
 
-    assert "sk-key-low" in VALID_API_KEYS
-    assert "sk-key-high" in VALID_API_KEYS
-    assert RATE_LIMIT_RULES["sk-key-low"] == 2
-    assert RATE_LIMIT_RULES["sk-key-high"] == 5
+    # Keys are held as digests, so a leaked database or memory dump yields
+    # nothing presentable as a credential.
+    assert hash_api_key("sk-key-low") in VALID_API_KEYS
+    assert hash_api_key("sk-key-high") in VALID_API_KEYS
+    assert RATE_LIMIT_RULES[hash_api_key("sk-key-low")] == 2
+    assert RATE_LIMIT_RULES[hash_api_key("sk-key-high")] == 5
 
     # Test low rate key
     # Request 1: Success
@@ -81,8 +83,8 @@ def test_admin_patch_budget_limits_and_rate_limits(monkeypatch):
         assert resp.json()["status"] == "success"
 
         # Verify changes propagated in-place to memory auth collections
-        assert "sk-key-admin-test" in VALID_API_KEYS
-        assert RATE_LIMIT_RULES["sk-key-admin-test"] == 12
+        assert hash_api_key("sk-key-admin-test") in VALID_API_KEYS
+        assert RATE_LIMIT_RULES[hash_api_key("sk-key-admin-test")] == 12
 
 
 def test_admin_auth_rejection_and_unconfigured(monkeypatch):
