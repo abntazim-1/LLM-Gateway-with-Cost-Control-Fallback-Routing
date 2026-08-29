@@ -647,11 +647,16 @@ async def chat_completions(
 
             async def cached_stream_generator():
                 content = cached_response["choices"][0]["message"]["content"]
+                # Restore once, over the whole string. Splitting into words
+                # first and restoring each meant any placeholder containing a
+                # space was never swapped back — the same whole-string
+                # operation handed fragments that broke the live stream path.
+                if vault_mapping:
+                    content = state.pii_vault.restore_text(content, vault_mapping)
+
                 words = content.split(" ")
                 for i, word in enumerate(words):
                     space = " " if i > 0 else ""
-                    if vault_mapping:
-                        word = state.pii_vault.restore_text(word, vault_mapping)
                     chunk = {
                         "id": cached_response["id"],
                         "object": "chat.completion.chunk",
@@ -666,7 +671,13 @@ async def chat_completions(
                         ],
                     }
                     yield f"data: {json.dumps(chunk)}\n\n"
-                    await asyncio.sleep(0.01)
+                    # Yield to the event loop so a long replay does not
+                    # monopolise it, but add no delay of its own. Pacing the
+                    # replay at 10ms a word to look generated made a 400-word
+                    # cache hit take 5s against 0.17s for the miss it was
+                    # meant to save — thirty times slower than not caching.
+                    await asyncio.sleep(0)
+
                 final_chunk = {
                     "id": cached_response["id"],
                     "object": "chat.completion.chunk",
@@ -674,6 +685,10 @@ async def chat_completions(
                     "model": cached_response["model"],
                     "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                 }
+                # Carry the stored token counts, so a client reading usage
+                # gets the same shape from a hit as from a miss.
+                if cached_response.get("usage"):
+                    final_chunk["usage"] = cached_response["usage"]
                 yield f"data: {json.dumps(final_chunk)}\n\n"
                 yield "data: [DONE]\n\n"
 
@@ -683,9 +698,9 @@ async def chat_completions(
                 headers=_stream_headers(request_id, backend_id="cache"),
             )
         if vault_mapping:
-            # Restore on a copy — the cache entry must stay in masked form so
-            # future hits restore against their own request's mapping.
-            cached_response = json.loads(json.dumps(cached_response))
+            # `get` already returned a private copy, so restoring in place
+            # cannot reach the stored entry — which must stay masked for the
+            # next caller to restore through their own mapping.
             for choice in cached_response.get("choices", []):
                 message = choice.get("message", {})
                 if message.get("content"):

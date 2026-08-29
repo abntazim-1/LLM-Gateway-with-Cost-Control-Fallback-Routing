@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import json
 import threading
@@ -20,6 +21,19 @@ class PromptCache:
     bypass the cache entirely. The default of 1.0 preserves the historical
     behaviour of caching everything; set it to 0 to serve only deterministic
     requests from cache.
+
+    Tenancy: the key is derived from the prompt alone, so the cache is shared
+    by every client. This is a deliberate trade of isolation for hit rate,
+    and it is safe for masked PII — entries are stored in masked form and
+    each caller restores through their own vault mapping, so two clients
+    asking the same question each see their own values.
+
+    What it does leak is *existence*. A hit returns in a few milliseconds
+    against a few hundred for a miss, so a client who guesses another
+    client's exact prompt can tell from the latency alone that someone asked
+    it. Keying on the client as well would close that, at the cost of every
+    cross-client hit. Do it before onboarding tenants who must not learn
+    about each other; until then this is the documented trade.
     """
 
     def __init__(
@@ -104,7 +118,11 @@ class PromptCache:
 
             # Move to end to mark as recently used
             self.cache.move_to_end(key)
-            return entry["response"]
+            # A copy, not the stored object. Callers restore PII into the
+            # response they were handed, and doing that to the shared entry
+            # would bake one caller's private values into what every later
+            # caller receives.
+            return copy.deepcopy(entry["response"])
 
     def set(
         self,
@@ -118,7 +136,12 @@ class PromptCache:
         with self.lock:
             if key in self.cache:
                 self.cache.move_to_end(key)
-            self.cache[key] = {"timestamp": time.time(), "response": response}
+            # Copy on the way in as well: the caller keeps a reference to
+            # the response it stored and may go on to modify it.
+            self.cache[key] = {
+                "timestamp": time.time(),
+                "response": copy.deepcopy(response),
+            }
             # Enforce max capacity eviction (FIFO/LRU eviction of oldest item)
             while len(self.cache) > self.max_entries:
                 self.cache.popitem(last=False)
