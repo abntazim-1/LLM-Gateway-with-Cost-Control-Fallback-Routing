@@ -6,6 +6,11 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 from gateway.adapters.base import BaseAdapter, NormalizedResponse
 from gateway.policy.circuit_breaker import CircuitBreakerRegistry
+from gateway.telemetry.metrics import (
+    observe_deadline_exceeded,
+    observe_fallback,
+    observe_throttled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -527,6 +532,7 @@ class Router:
                         f"Deadline reached after {time.monotonic() - started:.1f}s; "
                         f"not attempting {adapter.id}"
                     )
+                    observe_deadline_exceeded()
                     raise DeadlineExceededException(
                         f"Request exceeded its {self.total_deadline_sec:.0f}s budget "
                         f"across {rank_idx + 1} backend(s). "
@@ -578,6 +584,7 @@ class Router:
                         # weaker model than was selected, so mark it rather
                         # than let the substitution pass silently.
                         updates["is_fallback"] = True
+                        observe_fallback(adapter.id)
                     if updates:
                         response = response.model_copy(update=updates)
                     return response
@@ -598,6 +605,8 @@ class Router:
                 except Exception as e:
                     last_error = e
                     throttled = is_rate_limit_error(e)
+                    if throttled:
+                        observe_throttled(adapter.id)
 
                     if attempt < max_retries:
                         # Honour the provider's own Retry-After when it sent

@@ -198,3 +198,71 @@ async def test_a_genuinely_broken_backend_does_open_its_breaker():
 
     breaker = router.circuit_registry.get_breaker("cheap")
     assert not await breaker.can_request(), "a failing backend must be cut off"
+
+
+# ── Metrics ──────────────────────────────────────────────────────────────
+# Failover and throttling both keep requests succeeding, which is the point —
+# and also why they are invisible without a counter. An outage would otherwise
+# surface only as next month's bill.
+
+
+def _counter_value(counter, **labels) -> float:
+    child = counter.labels(**labels) if labels else counter
+    return child._value.get()
+
+
+@pytest.mark.asyncio
+async def test_failover_increments_the_fallback_counter():
+    from gateway.telemetry.metrics import FALLBACK_TOTAL
+
+    broken = _Adapter(_cfg("cheap"), behaviour="broken")
+    healthy = _Adapter(_cfg("pricey", cost_per_1k_prompt=0.05))
+    router = _router(broken, healthy, timeout_sec=2.0, total_deadline_sec=20.0)
+
+    before = _counter_value(FALLBACK_TOTAL, backend="pricey")
+    await router.execute(messages=MSG)
+
+    assert _counter_value(FALLBACK_TOTAL, backend="pricey") == before + 1
+
+
+@pytest.mark.asyncio
+async def test_throttling_increments_its_own_counter():
+    from gateway.telemetry.metrics import THROTTLED_TOTAL
+
+    throttled = _Adapter(_cfg("cheap"), behaviour="rate_limited")
+    healthy = _Adapter(_cfg("pricey", cost_per_1k_prompt=0.05))
+    router = _router(throttled, healthy, timeout_sec=2.0, total_deadline_sec=20.0)
+
+    before = _counter_value(THROTTLED_TOTAL, backend="cheap")
+    await router.execute(messages=MSG)
+
+    # Counted per failed attempt, so the signal reflects how hard the limit
+    # is being hit rather than merely that it was.
+    assert _counter_value(THROTTLED_TOTAL, backend="cheap") > before
+
+
+@pytest.mark.asyncio
+async def test_exhausting_the_budget_increments_the_deadline_counter():
+    from gateway.telemetry.metrics import DEADLINE_EXCEEDED_TOTAL
+
+    slow = _Adapter(_cfg("slow"), delay=5.0)
+    router = _router(slow, timeout_sec=5.0, total_deadline_sec=1.5)
+
+    before = _counter_value(DEADLINE_EXCEEDED_TOTAL)
+    with pytest.raises(DeadlineExceededException):
+        await router.execute(messages=MSG)
+
+    assert _counter_value(DEADLINE_EXCEEDED_TOTAL) == before + 1
+
+
+def test_latency_buckets_cover_real_llm_latencies():
+    """Prometheus' defaults top out at 10, assuming seconds. Latency here is
+    milliseconds, so every real call previously landed in +Inf and no
+    percentile could be computed from the histogram at all."""
+    from gateway.telemetry.metrics import LATENCY_BUCKETS_MS
+
+    observed_ms = [394, 587, 4753, 50717]
+    for ms in observed_ms:
+        assert any(
+            ms <= b for b in LATENCY_BUCKETS_MS if b != float("inf")
+        ), f"{ms}ms falls outside every finite bucket"
