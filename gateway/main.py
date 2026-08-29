@@ -210,6 +210,30 @@ async def health_check_loop():
         await asyncio.sleep(60)
 
 
+# A reservation is released by the request that took it. This exists only for
+# the case where that never happens because the process was killed outright —
+# so it runs rarely and does nothing at all in a healthy gateway.
+RECLAIM_INTERVAL_SEC = 300.0
+_RECLAIM_DEADLINE_MULTIPLE = 3.0
+
+
+async def reclaim_loop(ledger: LedgerStore, stale_after_sec: float) -> None:
+    """Periodically give back budget held by requests that cannot still run."""
+    while True:
+        await asyncio.sleep(RECLAIM_INTERVAL_SEC)
+        try:
+            freed = await ledger.reclaim_stale_reservations(stale_after_sec)
+            if freed["count"]:
+                logger.warning(
+                    f"Reclaimed {freed['count']} stale budget reservation(s) "
+                    f"worth ${freed['amount_usd']:.6f}"
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Reservation reclaim failed: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _state
@@ -313,11 +337,35 @@ async def lifespan(app: FastAPI):
         guardrails_pipeline=guardrails_pipeline,
     )
 
+    # A hold is only ever stale relative to how long a request may run, so
+    # derive the threshold from the deadline rather than picking a number:
+    # comfortably past the point where a request could still be in flight.
+    stale_after_sec = max(
+        300.0, cb_config.get("total_deadline_sec", 90.0) * _RECLAIM_DEADLINE_MULTIPLE
+    )
+
+    # Sweep once at startup: a hold outstanding here was almost certainly
+    # left by the process this one replaced. The age threshold still applies,
+    # because a second gateway sharing this ledger may have live requests of
+    # its own, and reclaiming those would refund spend that is about to
+    # happen.
+    try:
+        freed = await ledger.reclaim_stale_reservations(stale_after_sec)
+        if freed["count"]:
+            logger.warning(
+                f"Reclaimed {freed['count']} budget reservation(s) worth "
+                f"${freed['amount_usd']:.6f} left by a previous process"
+            )
+    except Exception as e:  # never block startup on housekeeping
+        logger.error(f"Reservation reclaim failed at startup: {e}")
+
     bg_task = asyncio.create_task(health_check_loop())
+    reclaim_task = asyncio.create_task(reclaim_loop(ledger, stale_after_sec))
 
     yield
 
     bg_task.cancel()
+    reclaim_task.cancel()
     _state = None
     await ledger_queue.stop()
     await router.close()
@@ -660,7 +708,20 @@ async def chat_completions(
             raise HTTPException(status_code=400, detail=str(e))
 
         if target_adapter:
-            prompt_tokens = target_adapter.count_prompt_tokens(sanitized_messages)
+            # Price the hold against the most expensive backend this request
+            # could reach, not the one it is tried on first. Failover can land
+            # on a pricier backend, so reserving on the first choice let the
+            # budget check pass on a price that was never paid — 50% over the
+            # limit on the current config, and worse the wider the spread.
+            #
+            # Over-reserving is the safe direction: the hold is reconciled
+            # down to real usage once the response completes, so the cost of
+            # aiming high is headroom, not money.
+            costliest = max(
+                ranked_adapters,
+                key=lambda a: a.cost_per_1k_prompt + a.cost_per_1k_completion,
+            )
+            prompt_tokens = costliest.count_prompt_tokens(sanitized_messages)
 
             # Reserve against max_tokens (the ceiling this request could
             # reach) rather than a guess at actual length — under-reserving
@@ -669,16 +730,16 @@ async def chat_completions(
             # completes, so a high ceiling costs headroom, not money.
             completion_tokens = body.get("max_tokens", 256)
 
-            prompt_cost = (prompt_tokens / 1000.0) * target_adapter.cost_per_1k_prompt
+            prompt_cost = (prompt_tokens / 1000.0) * costliest.cost_per_1k_prompt
             completion_cost = (
                 completion_tokens / 1000.0
-            ) * target_adapter.cost_per_1k_completion
+            ) * costliest.cost_per_1k_completion
             estimated_cost = prompt_cost + completion_cost
         else:
             estimated_cost = 0.0
 
         await state.budget_policy.check_and_reserve(
-            api_key, estimated_cost=estimated_cost
+            api_key, estimated_cost=estimated_cost, request_id=str(request_id)
         )
     except BudgetExceededException as e:
         raise HTTPException(status_code=429, detail=str(e))

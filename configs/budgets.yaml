@@ -1,3 +1,19 @@
+# Per-client spend limits.
+#
+# Periods are UTC. "Daily" means 00:00-24:00 UTC, not the client's local day,
+# so a client far from UTC sees their limit reset partway through their own
+# morning. This is deliberate: a per-client timezone would have two clients'
+# days rolling over at different instants, and "spend today" would stop
+# meaning one thing across the ledger.
+#
+# A limit is enforced by holding the estimated cost before the request runs
+# and correcting it to actual afterwards. The hold is sized for the most
+# expensive backend the request could reach, so failover cannot breach a
+# limit that has already been checked — which means a request may be refused
+# on a worst-case price it would not have paid. That is the safe direction:
+# refusing a request that would have fit costs a retry, admitting one that
+# does not costs money.
+
 budgets:
   - api_key: "${CLIENT_API_KEY_TIER1:-sk-test-tier-1}"
     daily_limit_usd: 1.00

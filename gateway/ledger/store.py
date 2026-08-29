@@ -4,6 +4,7 @@ import os
 import re
 import sqlite3
 import threading
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -172,6 +173,31 @@ class LedgerStore(BaseLedgerStore):
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_feedback_request "
                 "ON feedback (request_id)"
+            )
+            # An open hold on a client's budget, written in the same
+            # transaction that increments spend and deleted in the one that
+            # reconciles it. Its purpose is crash recovery: the request path
+            # releases holds in a `finally`, but a process that is killed
+            # outright (OOM, SIGKILL, a free-tier instance being evicted)
+            # never runs one, and the hold then counts against the client
+            # forever — phantom spend nobody can find or refund.
+            #
+            # The period stamps record which counters this hold was added to,
+            # so a reclaim after a daily or monthly reset does not subtract
+            # from a counter that was already zeroed.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS reservations (
+                    request_id  TEXT PRIMARY KEY,
+                    api_key     TEXT NOT NULL,
+                    amount_usd  REAL NOT NULL,
+                    reset_date  TEXT,
+                    reset_month TEXT,
+                    reserved_at REAL NOT NULL
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_reservations_age "
+                "ON reservations (reserved_at)"
             )
             # Display label for a key whose plaintext is no longer stored.
             # Added rather than assumed present, so an existing database
@@ -402,6 +428,9 @@ class LedgerStore(BaseLedgerStore):
             """,
                 (delta, delta, api_key),
             )
+            # The hold has been replaced by the real figure, so it is no
+            # longer outstanding and must not be reclaimed later.
+            conn.execute("DELETE FROM reservations WHERE request_id = ?", (req_id,))
             conn.commit()
 
     async def get_circuit_breaker_state(
@@ -614,15 +643,18 @@ class LedgerStore(BaseLedgerStore):
                 return False
 
     async def check_and_reserve_budget(
-        self, api_key: str, estimated_cost: float
+        self, api_key: str, estimated_cost: float, request_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """Atomically check limits and pre-increment spend by estimated_cost."""
         return await asyncio.to_thread(
-            self._check_and_reserve_budget_sync, api_key, estimated_cost
+            self._check_and_reserve_budget_sync, api_key, estimated_cost, request_id
         )
 
     def _check_and_reserve_budget_sync(
-        self, api_key: str, estimated_cost: float
+        self,
+        api_key: str,
+        estimated_cost: float,
+        request_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Single-transaction atomic check + reserve under the write lock."""
         from gateway.policy.budget import BudgetExceededException
@@ -643,6 +675,13 @@ class LedgerStore(BaseLedgerStore):
                 raise ValueError(f"No budget found for API key: {api_key}")
 
             budget = dict(row)
+            # Periods are UTC, not the client's local time: "daily" means
+            # 00:00-24:00 UTC. Deliberate — a per-client timezone would make
+            # two clients' days reset at different instants, so a single
+            # "spend today" figure would no longer mean one thing. The cost
+            # is that a client far from UTC sees their reset mid-morning, so
+            # it is documented in configs/budgets.yaml rather than left to be
+            # discovered.
             now_utc = datetime.now(timezone.utc)
             today_str = now_utc.strftime("%Y-%m-%d")
             month_str = now_utc.strftime("%Y-%m")
@@ -709,11 +748,104 @@ class LedgerStore(BaseLedgerStore):
             """,
                 (estimated_cost, estimated_cost, api_key),
             )
+            # Record the open hold so it can be reclaimed if this process
+            # dies before reconciling. Same transaction as the increment
+            # above: a hold that exists without its spend, or spend without
+            # its hold, would be worse than either alone.
+            if request_id:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO reservations
+                        (request_id, api_key, amount_usd,
+                         reset_date, reset_month, reserved_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                    (
+                        request_id,
+                        api_key,
+                        estimated_cost,
+                        budget["last_reset_date"],
+                        budget["last_reset_month"],
+                        time.time(),
+                    ),
+                )
             conn.commit()
 
             budget["spend_today"] = projected_daily
             budget["spend_month"] = projected_monthly
             return budget
+            budget["spend_month"] = projected_monthly
+            return budget
+
+    async def reclaim_stale_reservations(
+        self, older_than_sec: float = 300.0
+    ) -> Dict[str, Any]:
+        """Release holds left behind by a process that died mid-request."""
+        return await asyncio.to_thread(
+            self._reclaim_stale_reservations_sync, older_than_sec
+        )
+
+    def _reclaim_stale_reservations_sync(
+        self, older_than_sec: float = 300.0
+    ) -> Dict[str, Any]:
+        """Give back budget held by requests that can no longer be running.
+
+        The request path releases its own hold in a `finally`, so anything
+        still outstanding well past the total request deadline belongs to a
+        process that was killed before it could. Left alone that hold counts
+        against the client permanently, and enough of them lock a client out
+        of a budget they never spent.
+
+        *older_than_sec* must comfortably exceed total_deadline_sec, or this
+        would claw back budget from requests that are still in flight.
+        """
+        cutoff = time.time() - older_than_sec
+
+        with self._write_lock:
+            conn = self._get_connection()
+            rows = [
+                dict(r)
+                for r in conn.execute(
+                    "SELECT request_id, api_key, amount_usd, reset_date,"
+                    " reset_month FROM reservations WHERE reserved_at < ?",
+                    (cutoff,),
+                )
+            ]
+
+            reclaimed = 0.0
+            for row in rows:
+                budget = conn.execute(
+                    "SELECT last_reset_date, last_reset_month FROM budgets"
+                    " WHERE api_key = ?",
+                    (row["api_key"],),
+                ).fetchone()
+                if not budget:
+                    continue
+
+                # Only give back to a counter that still carries this hold.
+                # A reset since the reservation was taken has already zeroed
+                # it, and subtracting again would refund spend twice.
+                amount = row["amount_usd"]
+                daily = (
+                    amount if budget["last_reset_date"] == row["reset_date"] else 0.0
+                )
+                monthly = (
+                    amount if budget["last_reset_month"] == row["reset_month"] else 0.0
+                )
+                if daily or monthly:
+                    conn.execute(
+                        "UPDATE budgets"
+                        " SET spend_today = MAX(0, spend_today - ?),"
+                        "     spend_month = MAX(0, spend_month - ?)"
+                        " WHERE api_key = ?",
+                        (daily, monthly, row["api_key"]),
+                    )
+                reclaimed += daily
+
+            conn.execute("DELETE FROM reservations WHERE reserved_at < ?", (cutoff,))
+            conn.commit()
+
+        return {"count": len(rows), "amount_usd": reclaimed}
 
     def get_all_api_keys_sync(self) -> list:
         conn = self._get_connection()

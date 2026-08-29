@@ -1,3 +1,5 @@
+from typing import Optional
+
 from gateway.ledger.store import LedgerStore
 
 
@@ -10,7 +12,10 @@ class BudgetPolicy:
         self.ledger = ledger
 
     async def check_and_reserve(
-        self, api_key: str, estimated_cost: float = 0.0
+        self,
+        api_key: str,
+        estimated_cost: float = 0.0,
+        request_id: Optional[str] = None,
     ) -> bool:
         """
         Atomically verify budget limits and reserve *estimated_cost* against
@@ -22,8 +27,14 @@ class BudgetPolicy:
 
         Raises BudgetExceededException if a limit would be breached.
         The reservation is later corrected by record_request(reserved_cost=...).
+
+        *request_id* ties the hold to the request that took it, so a hold left
+        behind by a process that died before reconciling can be identified and
+        given back rather than counting against the client forever.
         """
-        await self.ledger.check_and_reserve_budget(api_key, estimated_cost)
+        await self.ledger.check_and_reserve_budget(
+            api_key, estimated_cost, request_id=request_id
+        )
         return True
 
     # ── Backwards-compat shim ────────────────────────────────────────────────
