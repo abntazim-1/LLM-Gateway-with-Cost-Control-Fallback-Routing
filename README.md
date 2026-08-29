@@ -9,7 +9,7 @@ One OpenAI-compatible endpoint that decides *which model* serves a request,
 
 [![CI](https://github.com/abntazim-1/LLM-Gateway-with-Cost-Control-Fallback-Routing/actions/workflows/ci.yml/badge.svg)](https://github.com/abntazim-1/LLM-Gateway-with-Cost-Control-Fallback-Routing/actions/workflows/ci.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
-[![Tests](https://img.shields.io/badge/tests-134%20passing-brightgreen.svg)](#quality)
+[![Tests](https://img.shields.io/badge/tests-288%20passing-brightgreen.svg)](#quality)
 [![Evals](https://img.shields.io/badge/policy%20evals-61%2F61-brightgreen.svg)](#quality)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 
@@ -91,8 +91,12 @@ a different one.
 ### Cost control
 Requests are priced before they run and reconciled against real provider usage
 afterwards. Daily and monthly budgets are checked and reserved **atomically**,
-so concurrent requests cannot collectively overshoot a limit. Every request is
-recorded per client and per backend in a SQLite ledger.
+so concurrent requests cannot collectively overshoot a limit. The reservation is
+priced against the **most expensive backend the request could reach**, so
+failing over to a pricier one cannot breach a limit that has already passed. A
+hold left behind by a process that died mid-request is reclaimed rather than
+counting against the client forever. Every request is recorded per client and
+per backend in a SQLite ledger.
 
 ### Model routing
 | Strategy | Selects |
@@ -117,14 +121,30 @@ opened, subsequent requests skipped the dead backend in under 0.5 s.
 ### Data handling
 PII is replaced with indexed placeholders (`[EMAIL_1]`) before the prompt
 reaches a provider and restored on the way back — the model never sees real
-values, the caller never sees placeholders. Prompts are screened for injection
-patterns including obfuscated forms; completions are screened for leaked
-credentials.
+values, the caller never sees placeholders. One value keeps one placeholder
+wherever it appears, so a repeated address does not read to the model as two
+different people. Prompts are screened for injection patterns including
+obfuscated forms; completions are screened for leaked credentials.
+
+Both hold on **streamed** responses. A secret or a placeholder split across
+chunk boundaries matches nothing when each chunk is checked alone, so screening
+holds back only the smallest tail that could still be part of one — ordinary
+text streams with a six-character lag, and a response that leaks its system
+prompt is cut off rather than merely left uncached.
 
 ### Observability
 Prometheus metrics, OpenTelemetry spans, a queryable request ledger, and a
 Streamlit operator dashboard covering spend, latency, cache hit rate, backend
 health, and answer-quality ratings.
+
+Several counters exist specifically for things that otherwise **succeed
+quietly**: `fallback_total` (failover keeps requests working, so an outage
+surfaces as a larger bill rather than as errors), `throttled_total`,
+`deadline_exceeded_total`, and `guardrail_blocked_total` — over-blocking
+produces silence, because a wrongly refused caller stops using the gateway
+rather than filing a bug. Latency buckets are sized for real LLM calls;
+Prometheus' defaults assume seconds and put every millisecond measurement in
+`+Inf`.
 
 ---
 
@@ -184,12 +204,16 @@ circuit breakers operate on adapters, not on any particular vendor.
 BACKENDS_CONFIG_PATH=configs/backends.cloud.yaml
 ```
 
-That config ships ready to use: Groq's free tier as the cheap default, GPT-4o
-mini as the premium tier, and Claude Haiku as a **different-vendor** failover —
-so one provider's outage doesn't take the gateway down with it. Note that
-`provider: openai` means "speaks the OpenAI wire protocol", not "is OpenAI":
-Groq, Together, Fireworks, OpenRouter and vLLM all use that adapter with a
-different `endpoint`.
+That config ships ready to use on Groq's free tier alone — `gpt-oss-20b` as the
+cheap default and `gpt-oss-120b` for prompts that warrant it — so a public demo
+costs nothing and visitors need no key of their own. OpenAI and Anthropic
+entries are included but commented out; uncommenting one adds a
+**different-vendor** failover, so a single provider's outage cannot take the
+gateway down with it.
+
+Note that `provider: openai` means "speaks the OpenAI wire protocol", not "is
+OpenAI": Groq, Together, Fireworks, OpenRouter and vLLM all use that adapter
+with a different `endpoint`.
 
 Two values must be re-derived per model rather than copied:
 
@@ -261,7 +285,7 @@ real.
 | `configs/backends.yaml` | Endpoint, pricing, `capability_tier`, `context_length`, tokenizer |
 | `configs/routing_policy.yaml` | Active strategy and thresholds |
 | `configs/budgets.yaml` | Per-client spend and rate limits |
-| `configs/circuit_breaker.yaml` | Failure threshold, cooldown, request timeout |
+| `configs/circuit_breaker.yaml` | Failure threshold, cooldown, per-attempt timeout, total request deadline |
 
 `capability_tier` is declared **separately from price** deliberately. Routing
 that means "use the better model" ranks on capability, not cost. The two usually
@@ -273,7 +297,7 @@ which is the opposite of the intent.
 ## Quality
 
 ```bash
-pytest                      # 134 tests
+pytest                      # 288 tests
 python evals/run_evals.py   # 61 policy eval cases
 ```
 
