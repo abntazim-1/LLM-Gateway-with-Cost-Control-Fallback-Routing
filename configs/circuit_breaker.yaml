@@ -1,5 +1,18 @@
 circuit_breaker:
   failure_threshold: 3
   cooldown_period_sec: 30
+
+  # Ceiling on a single attempt against one backend.
   request_timeout_sec: 60.0
 
+  # Ceiling on the whole request, across every retry and every failover.
+  #
+  # Without it, request_timeout_sec bounds nothing useful: three attempts
+  # against two backends plus backoff is over six minutes before the caller
+  # sees an error. Real clients give up long before that and retry, which
+  # adds load to a backend that is already struggling.
+  #
+  # 90s is chosen to allow a slow first backend to finish, or a fast failover
+  # and a full second attempt — while staying under the 100-120s timeout most
+  # HTTP clients and proxies impose by default.
+  total_deadline_sec: 90.0

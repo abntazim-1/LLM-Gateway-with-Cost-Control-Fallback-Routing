@@ -124,6 +124,63 @@ class NoAvailableBackendException(Exception):
     pass
 
 
+class DeadlineExceededException(Exception):
+    """The request's total time budget ran out before any backend answered."""
+
+    pass
+
+
+# Below this much remaining budget an attempt cannot plausibly finish, so
+# starting one only delays the error the caller is already going to receive.
+_MIN_ATTEMPT_SEC = 1.0
+
+
+# A provider saying "too fast" is not a provider that is broken, and the two
+# need opposite responses: back off and keep using a throttled backend, stop
+# using a failing one. Counting 429s toward the breaker opened it after three
+# rate-limit replies and pushed traffic onto a pricier backend — so hitting a
+# free tier's limit quietly cost money.
+_RATE_LIMIT_MARKERS = (
+    "429",
+    "rate limit",
+    "rate_limit",
+    "too many requests",
+    "quota exceeded",
+)
+
+
+def is_rate_limit_error(exc: Exception) -> bool:
+    """Whether an adapter failure means "slow down" rather than "you're broken".
+
+    Matches on the message because adapters wrap provider errors in
+    AdapterException rather than surfacing a status code. Crude, but the
+    alternative — treating throttling as breakage — is actively harmful.
+    """
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status == 429:
+        return True
+    text = str(exc).lower()
+    return any(marker in text for marker in _RATE_LIMIT_MARKERS)
+
+
+def retry_after_seconds(exc: Exception) -> Optional[float]:
+    """The provider's own Retry-After hint, when it sent one.
+
+    Preferring it to a guess is the difference between backing off for exactly
+    as long as required and hammering a throttled endpoint.
+    """
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    if not headers:
+        return None
+    raw = headers.get("retry-after") or headers.get("Retry-After")
+    if raw is None:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return None
+
+
 class ContextLengthExceededException(Exception):
     """No healthy backend has a context window large enough for this request.
 
@@ -142,11 +199,18 @@ class Router:
         timeout_sec: float = 30.0,
         min_tokens_for_complex: int = 500,
         latency_recheck_sec: float = 300.0,
+        total_deadline_sec: Optional[float] = None,
     ):
         self.adapters = adapters
         self.circuit_registry = circuit_registry
         self.strategy = strategy
         self.timeout_sec = timeout_sec
+        # Ceiling on the whole request, across every retry and every failover.
+        # `timeout_sec` bounds a single attempt, which bounds nothing useful:
+        # 3 attempts against 2 backends plus backoff is 6 minutes before the
+        # caller sees anything. Real clients give up long before that and
+        # retry, adding load to a backend that is already struggling.
+        self.total_deadline_sec = total_deadline_sec or (timeout_sec * 2)
         self.min_tokens_for_complex = min_tokens_for_complex
         # How long a latency measurement stays trusted before the backend is
         # re-probed under latency_first. Without this a single slow sample
@@ -436,6 +500,8 @@ class Router:
         return (-float(adapter.capability_tier), adapter.cost_per_1k_prompt)
 
     async def execute(self, messages: List[Dict[str, str]], **kwargs):
+        started = time.monotonic()
+        deadline = started + self.total_deadline_sec
         ranked = await self.get_ranked_adapters(messages=messages, **kwargs)
 
         last_error = None
@@ -452,14 +518,31 @@ class Router:
 
             max_retries = 2
             for attempt in range(max_retries + 1):
+                # An attempt may never outlive the request's own budget, and
+                # starting one that cannot finish inside it only delays the
+                # error the caller is already going to get.
+                remaining = deadline - time.monotonic()
+                if remaining <= _MIN_ATTEMPT_SEC:
+                    logger.warning(
+                        f"Deadline reached after {time.monotonic() - started:.1f}s; "
+                        f"not attempting {adapter.id}"
+                    )
+                    raise DeadlineExceededException(
+                        f"Request exceeded its {self.total_deadline_sec:.0f}s budget "
+                        f"across {rank_idx + 1} backend(s). "
+                        f"Last error: {last_error}"
+                    )
+                attempt_timeout = min(self.timeout_sec, remaining)
                 try:
                     logger.info(
                         f"Routing request to {adapter.id} using model {adapter.model} "
-                        f"(attempt {attempt + 1}/{max_retries + 1}, timeout {self.timeout_sec}s)"
+                        f"(attempt {attempt + 1}/{max_retries + 1}, "
+                        f"timeout {attempt_timeout:.1f}s, "
+                        f"{remaining:.1f}s of budget left)"
                     )
                     response = await asyncio.wait_for(
                         adapter.complete(messages, **call_kwargs),
-                        timeout=self.timeout_sec,
+                        timeout=attempt_timeout,
                     )
 
                     # Update Exponential Moving Average (EMA) for latency
@@ -500,29 +583,52 @@ class Router:
                     return response
                 except asyncio.TimeoutError:
                     last_error = asyncio.TimeoutError(
-                        f"Backend {adapter.id} timed out after {self.timeout_sec}s"
+                        f"Backend {adapter.id} timed out after {attempt_timeout:.1f}s"
                     )
                     logger.warning(str(last_error))
                     if attempt < max_retries:
-                        backoff = 2**attempt
-                        logger.warning(f"Retrying {adapter.id} in {backoff}s...")
+                        # Capped at the remaining budget: sleeping longer than
+                        # the request has left only postpones its failure.
+                        backoff = min(2**attempt, max(0.0, deadline - time.monotonic()))
+                        logger.warning(f"Retrying {adapter.id} in {backoff:.1f}s...")
                         await asyncio.sleep(backoff)
                     else:
                         await breaker.record_failure()
                         break  # move to next adapter
                 except Exception as e:
                     last_error = e
+                    throttled = is_rate_limit_error(e)
+
                     if attempt < max_retries:
-                        backoff = 2**attempt
+                        # Honour the provider's own Retry-After when it sent
+                        # one; guessing is what turns a throttle into an
+                        # outage.
+                        backoff = retry_after_seconds(e)
+                        if backoff is None:
+                            backoff = 2**attempt
+                        # Never sleep past the deadline — waiting to retry a
+                        # request that can no longer finish is pure delay.
+                        backoff = min(backoff, max(0.0, deadline - time.monotonic()))
                         logger.warning(
-                            f"Transient failure on {adapter.id} ({str(e)}). Retrying in {backoff}s..."
+                            f"{'Throttled by' if throttled else 'Transient failure on'} "
+                            f"{adapter.id} ({str(e)}). Retrying in {backoff:.1f}s..."
                         )
                         await asyncio.sleep(backoff)
                     else:
                         logger.warning(
                             f"Backend {adapter.id} failed after {max_retries + 1} attempts: {str(e)}"
                         )
-                        await breaker.record_failure()
+                        if throttled:
+                            # Being throttled means the backend is healthy and
+                            # busy. Opening its breaker would route traffic to
+                            # a pricier one for the cooldown, so a free tier's
+                            # limit would quietly become a bill.
+                            logger.info(
+                                f"{adapter.id} is rate limited, not failing — "
+                                f"leaving its circuit breaker closed"
+                            )
+                        else:
+                            await breaker.record_failure()
                         break  # move to next adapter
 
         raise NoAvailableBackendException(

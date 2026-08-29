@@ -38,6 +38,7 @@ from gateway.policy.guardrails import GuardrailsPipeline, GuardrailViolationExce
 from gateway.policy.pii import PiiSanitizer, PiiVault
 from gateway.policy.router import (
     ContextLengthExceededException,
+    DeadlineExceededException,
     NoAvailableBackendException,
     Router,
 )
@@ -291,6 +292,7 @@ async def lifespan(app: FastAPI):
         circuit_registry,
         strategy=strategy,
         timeout_sec=cb_config.get("request_timeout_sec", 30.0),
+        total_deadline_sec=cb_config.get("total_deadline_sec"),
         min_tokens_for_complex=min_tokens_complex,
     )
 
@@ -951,6 +953,12 @@ async def chat_completions(
         except ContextLengthExceededException as e:
             observe_request("unknown", "error", 0.0, 0.0)
             raise HTTPException(status_code=400, detail=str(e))
+        except DeadlineExceededException as e:
+            # 504: the gateway itself gave up waiting on upstreams, which is
+            # what a timeout status means. Distinct from 503 (nothing healthy
+            # to try) — here backends existed but were too slow.
+            observe_request("unknown", "error", 0.0, 0.0)
+            raise HTTPException(status_code=504, detail=str(e))
         except NoAvailableBackendException as e:
             observe_request("unknown", "error", 0.0, 0.0)
             raise HTTPException(status_code=503, detail=str(e))
